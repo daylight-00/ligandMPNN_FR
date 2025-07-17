@@ -18,6 +18,7 @@ Iterative protein design pipeline combining LigandMPNN sequence generation with 
 
 ### Required Software
 ```bash
+# Core dependencies
 mamba create -n rfdaa -y \
     -c nvidia -c pytorch -c dglteam/label/th24_cu124 -c conda-forge -c defaults \
     python=3.12.11 \
@@ -40,20 +41,22 @@ mamba create -n rfdaa -y \
     numpy \
     ml-collections \
     dm-tree
-pip install -U git+https://github.com/jamesmkrieger/ProDy@unpin_numpy
+conda activate rfdaa 
 
-# Core dependencies
-pip install numpy prody
+pip install -U git+https://github.com/jamesmkrieger/ProDy@unpin_numpy
+pip install -U 'git+https://github.com/NVIDIA/DeepLearningExamples.git#subdirectory=DGLPyTorch/DrugDiscovery/SE3Transformer'
+
+# LigandMPNN Installation
+git clone https://github.com/daylight-00/LigandMPNN.git
 
 # PyRosetta (separate installation required)
 # Download from: https://www.pyrosetta.org/downloads
 ```
-
-### LigandMPNN Installation
+### Environment Setup
+Ensure your environment is set up correctly with the necessary paths.
 ```bash
-# Ensure LigandMPNN is installed at:
-# /home/hwjang/aipd/LigandMPNN/
-# Or modify paths in scripts accordingly
+export PYTHONPATH="/home/hwjang/aipd/PyRosetta4:/home/hwjang/aipd/LigandMPNN:/home/hwjang/aipd/ligandMPNN_FR:$PYTHONPATH"
+# Modify paths accordingly
 ```
 
 ## Key Differences
@@ -72,10 +75,10 @@ This implementation differs from the standard LigandMPNN `run.py` in several key
 
 #### 3. **API Updates for Latest Version**
 - **Key API Changes**: Updated `feature_dict` structure for LigandMPNN v_32_010_25
-  ```python
-  # Required additions for latest API
-  feature_dict["batch_size"] = 1
-  feature_dict["temperature"] = temperature
+    ```python
+    # Required additions for latest API
+    feature_dict["batch_size"] = 1
+    feature_dict["temperature"] = temperature
   ```
 - **Model Initialization**: Updated ProteinMPNN parameters and checkpoint loading
 
@@ -94,44 +97,44 @@ This implementation modernizes and extends Gyu Rie Lee's original LigandMPNN+Fas
 #### 2. **Code Architecture**
 - **Original**: Single monolithic script with global variables
 - **This Implementation**: 
-  - Modular class-based design
-  - Clean separation of concerns
-  - Multiple implementation versions (simple, complete, experimental)
+    - Modular class-based design
+    - Clean separation of concerns
+    - Multiple implementation versions (simple, complete, experimental)
 
 #### 3. **API Integration**
 - **Original**: Used `protein_mpnn_utils` and older featurization methods
 - **This Implementation**: 
-  - Uses latest `data_utils` and `model_utils`
-  - Updated `featurize()`, `parse_PDB()`, and `model.sample()` calls
-  - Proper handling of `feature_dict` structure
+    - Uses latest `data_utils` and `model_utils`
+    - Updated `featurize()`, `parse_PDB()`, and `model.sample()` calls
+    - Proper handling of `feature_dict` structure
 
 #### 4. **Error Handling and Robustness**
 - **Original**: Minimal error handling
 - **This Implementation**: 
-  - Comprehensive exception handling
-  - Input validation
-  - Graceful failure modes
+    - Comprehensive exception handling
+    - Input validation
+    - Graceful failure modes
 
 #### 5. **Configuration and Flexibility**
 - **Original**: Hardcoded parameters and limited options
 - **This Implementation**: 
-  - Extensive command-line interface
-  - Flexible constraint handling
-  - Multiple temperature and sampling options
+    - Extensive command-line interface
+    - Flexible constraint handling
+    - Multiple temperature and sampling options
 
 #### 6. **Output Organization**
 - **Original**: Basic file output
 - **This Implementation**: 
-  - Structured output directories
-  - Comprehensive logging
-  - Statistical analysis and reporting
+    - Structured output directories
+    - Comprehensive logging
+    - Statistical analysis and reporting
 
 #### 7. **PyRosetta Initialization**
 - **Original**: Complex initialization with manual flag construction
 - **This Implementation**: 
-  - Streamlined initialization process
-  - Better flag management
-  - Improved ligand parameter handling
+    - Streamlined initialization process
+    - Better flag management
+    - Improved ligand parameter handling
 
 ## Scripts
 
@@ -381,3 +384,7 @@ ls /home/hwjang/aipd/LigandMPNN/model_params/
 - **Multi-chain design**: Complex multi-protein systems
 - **Custom scoring**: User-defined scoring functions
 - **Batch processing**: High-throughput pipeline automation
+
+---
+
+For questions or issues, refer to the troubleshooting section or check the original LigandMPNN documentation at [LigandMPNN GitHub](https://github.com/dauparas/LigandMPNN).
