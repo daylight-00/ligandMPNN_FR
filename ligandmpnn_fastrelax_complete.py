@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-LigandMPNN with Fast Relax Integration - Complete Version
-Updated version based on latest LigandMPNN implementation
-
-This script integrates LigandMPNN sequence design with PyRosetta fast relax
-for iterative protein-ligand design optimization.
+LigandMPNN with Fast Relax Integration - Complete Version (spawn start method)
+Updated to use multiprocessing.spawn to ensure fresh PyRosetta threading
 
 Author: Updated version based on successful debugging session
 Date: 2025
@@ -16,248 +13,76 @@ import json
 import random
 import argparse
 import time
-import traceback
 import numpy as np
+import multiprocessing as mp
 from multiprocessing import cpu_count
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 
 # Global function for multiprocessing - must be at module level
 def fast_relax_worker(input_data):
     """
-    Worker function for multiprocessing fast relax with PyRosetta multithreading
-    This function runs in a separate process with its own PyRosetta instance
-    and utilizes PyRosetta's internal multithreading capabilities
+    Worker function for multiprocessing fast relax
+    Each process gets its own PyRosetta instance and uses PyRosetta's internal threading
     """
     pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads = input_data
-    
     try:
-        # Import PyRosetta in worker process (each process needs its own instance)
         import pyrosetta
         from pyrosetta.rosetta.protocols.relax import FastRelax
         from pyrosetta.rosetta.core.scoring import get_score_function
-        from pyrosetta.rosetta.basic.options import option
-        from pyrosetta.rosetta.basic.options.OptionKeys import run as run_options
-        
-        # Initialize PyRosetta with multithreading support
+
+        # Build init flags
         init_flags = ['-beta']
         if not verbose:
             init_flags.append('-mute all')
-        
-        # Enable PyRosetta multithreading if specified
         if pyrosetta_threads > 1:
             init_flags.extend([
                 f'-multithreading:total_threads {pyrosetta_threads}',
-                '-multithreading:interaction_graph_threads 1',
+                f'-multithreading:interaction_graph_threads {pyrosetta_threads}',
                 '-run:multiple_processes_writing_to_one_directory'
             ])
-        
         if use_genpot:
-            init_flags.extend([
-                '-gen_potential',
-                f'-extra_res_fa {ligand_params_path}'
-            ])
+            init_flags.extend(['-gen_potential', f'-extra_res_fa {ligand_params_path}'])
         else:
-            init_flags.extend([
-                f'-extra_res_fa {ligand_params_path}'
-            ])
-        
+            init_flags.append(f'-extra_res_fa {ligand_params_path}')
+
+        # Initialize PyRosetta with a single options string
         pyrosetta.init(' '.join(init_flags))
-        
-        # Set runtime threading options (additional safety)
-        if pyrosetta_threads > 1:
-            try:
-                option[run_options.nthreads].value(pyrosetta_threads)
-            except Exception:
-                pass  # Some versions may not support this option
-        
+
         # Load pose
         pose = pyrosetta.pose_from_pdb(pdb_path)
-        
         if pose.total_residue() == 0:
             raise ValueError("Empty pose loaded")
-        
-        # Set up FastRelax with multithreading optimized settings
+
+        # Setup and run FastRelax
         scorefxn = get_score_function()
         fr = FastRelax()
         fr.set_scorefxn(scorefxn)
-        
-        # Settings optimized for multithreading
         fr.constrain_relax_to_start_coords(True)
-        fr.coord_constrain_sidechains(True) 
+        fr.coord_constrain_sidechains(True)
         fr.ramp_down_constraints(False)
-        
-        # Enable multithreaded scoring if available
-        if pyrosetta_threads > 1:
-            try:
-                # Some FastRelax specific multithreading options
-                fr.set_script_from_file('')  # Use default script
-                # Note: Specific FastRelax multithreading may require additional setup
-            except Exception:
-                pass  # Fallback to standard settings
-        
-        # Run FastRelax (PyRosetta will use its internal multithreading)
         fr.apply(pose)
-        
-        # Save result
+
+        # Save output
         pose.dump_pdb(output_path)
-        
-        # Verify output
         if not os.path.exists(output_path):
             raise RuntimeError("Output PDB file was not created")
-        
-        return {
-            'success': True,
-            'input_path': pdb_path,
-            'output_path': output_path,
-            'pyrosetta_threads_used': pyrosetta_threads,
-            'error': None
-        }
-        
+
+        return {'success': True, 'input_path': pdb_path, 'output_path': output_path, 'error': None}
     except Exception as e:
-        return {
-            'success': False,
-            'input_path': pdb_path,
-            'output_path': output_path,
-            'pyrosetta_threads_used': pyrosetta_threads,
-            'error': str(e)
-        }
+        return {'success': False, 'input_path': pdb_path, 'output_path': output_path, 'error': str(e)}
 
 
-def get_optimal_worker_distribution(total_structures, max_workers=None, args=None):
-    """
-    Calculate optimal distribution of workers for hybrid multiprocessing + PyRosetta multithreading
-    
-    Args:
-        total_structures: Number of structures to process
-        max_workers: Maximum number of workers (None for auto-detect)
-        args: Argument namespace with CPU allocation strategy
-        
-    Returns:
-        dict with worker configuration including PyRosetta threading
-    """
-    # Get system information
-    cpu_cores = cpu_count()
-    
-    # Get PyRosetta threading preference
-    pyrosetta_threads_per_process = getattr(args, 'pyrosetta_threads_per_process', 1) if args else 1
-    enable_pyrosetta_threading = getattr(args, 'enable_pyrosetta_threading', False) if args else False
-    hybrid_parallelism = getattr(args, 'hybrid_parallelism', False) if args else False
-    auto_tune_threading = getattr(args, 'auto_tune_threading', False) if args else False
-    
-    # Auto-tune threading if requested
-    if auto_tune_threading or hybrid_parallelism:
-        enable_pyrosetta_threading = True
-        if cpu_cores >= 16:
-            # High-core systems: favor more processes, moderate threading
-            pyrosetta_threads_per_process = min(4, max(2, cpu_cores // 8))
-        elif cpu_cores >= 8:
-            # Medium systems: balanced approach
-            pyrosetta_threads_per_process = min(3, max(2, cpu_cores // 4))
-        elif cpu_cores >= 4:
-            # Low-core systems: favor threading over processes
-            pyrosetta_threads_per_process = 2
-        else:
-            # Very low-core systems: disable threading
-            enable_pyrosetta_threading = False
-            pyrosetta_threads_per_process = 1
-    
-    # Apply CPU allocation strategy
-    if args and hasattr(args, 'cpu_allocation_strategy'):
-        strategy = args.cpu_allocation_strategy
-        memory_per_worker = getattr(args, 'memory_per_worker_gb', 2.0)
-        
-        if strategy == 'conservative':
-            # Use 50% of available cores, reserve rest for system
-            available_cores = max(1, int(cpu_cores * 0.5))
-        elif strategy == 'aggressive':
-            # Use 90% of available cores
-            available_cores = max(1, int(cpu_cores * 0.9))
-        elif strategy == 'custom':
-            # Use exactly the specified max_workers
-            available_cores = max_workers if max_workers else max(1, cpu_cores - 1)
-        else:  # auto
-            # Default: reserve 1-2 cores for system
-            available_cores = max(1, cpu_cores - min(2, max(1, cpu_cores // 4)))
-    else:
-        # Fallback to original logic
-        available_cores = max(1, cpu_cores - 1)
-    
-    # Calculate optimal process/thread distribution
-    if enable_pyrosetta_threading and pyrosetta_threads_per_process > 1:
-        # Hybrid approach: processes × threads_per_process should not exceed available cores
-        total_thread_capacity = available_cores
-        
-        # Calculate optimal number of processes
-        optimal_processes = max(1, min(
-            total_structures,  # Don't exceed number of structures
-            total_thread_capacity // pyrosetta_threads_per_process,  # CPU constraint
-            8  # Reasonable upper limit for processes to avoid memory issues
-        ))
-        
-        # Adjust threads per process if needed
-        actual_threads_per_process = min(
-            pyrosetta_threads_per_process,
-            max(1, total_thread_capacity // optimal_processes)
-        )
-        
-        if max_workers is not None:
-            optimal_processes = min(optimal_processes, max_workers)
-        
-        total_effective_workers = optimal_processes * actual_threads_per_process
-        
-    else:
-        # Single-threaded PyRosetta approach
-        actual_threads_per_process = 1
-        
-        # Default max workers if not specified
-        if max_workers is None:
-            if args and args.cpu_allocation_strategy == 'custom':
-                optimal_processes = available_cores
-            else:
-                optimal_processes = min(available_cores, 8)  # Cap at 8 to avoid memory issues
-        else:
-            optimal_processes = min(max_workers, available_cores)
-        
-        # Adjust workers based on number of structures
-        optimal_processes = min(optimal_processes, total_structures)
-        total_effective_workers = optimal_processes
-    
-    # Memory consideration
-    memory_limited_workers = optimal_processes
-    try:
-        import psutil
-        available_memory_gb = psutil.virtual_memory().available / (1024**3)
-        memory_per_worker = getattr(args, 'memory_per_worker_gb', 2.0) if args else 2.0
-        
-        # Account for PyRosetta threading memory overhead
-        memory_per_process = memory_per_worker * (1 + 0.3 * (actual_threads_per_process - 1))
-        memory_limited_workers = max(1, int(available_memory_gb / memory_per_process))
-        optimal_processes = min(optimal_processes, memory_limited_workers)
-        
-    except ImportError:
-        # Fallback if psutil not available
-        pass
-    
-    # Apply sequential threshold
-    sequential_threshold = getattr(args, 'sequential_threshold', 2) if args else 2
-    if total_structures < sequential_threshold:
-        optimal_processes = 1
-        actual_threads_per_process = 1
-    
+def get_worker_config(num_structures, args):
+    num_processes = getattr(args, 'num_processes', min(4, cpu_count()))
+    pyrosetta_threads = getattr(args, 'pyrosetta_threads', 1)
+    num_processes = min(num_processes, num_structures)
+    if num_structures < 2:
+        num_processes = 1
+        pyrosetta_threads = 1
     return {
-        'optimal_workers': optimal_processes,
-        'pyrosetta_threads_per_process': actual_threads_per_process,
-        'total_effective_threads': optimal_processes * actual_threads_per_process,
-        'cpu_cores': cpu_cores,
-        'available_cores': available_cores,
-        'memory_limited_workers': memory_limited_workers,
-        'structures_per_worker': (total_structures + optimal_processes - 1) // optimal_processes,
-        'parallel_efficiency': min(1.0, total_structures / optimal_processes),
-        'hybrid_efficiency': min(1.0, (total_structures * actual_threads_per_process) / (optimal_processes * actual_threads_per_process)),
-        'strategy_used': getattr(args, 'cpu_allocation_strategy', 'auto') if args else 'auto',
-        'memory_per_worker_gb': getattr(args, 'memory_per_worker_gb', 2.0) if args else 2.0,
-        'threading_mode': 'hybrid' if enable_pyrosetta_threading and actual_threads_per_process > 1 else 'process_only'
+        'num_processes': num_processes,
+        'pyrosetta_threads': pyrosetta_threads
     }
 
 def setup_ligandmpnn():
@@ -275,12 +100,13 @@ def setup_ligandmpnn():
             parse_PDB,
             restype_int_to_str,
             restype_str_to_int,
+            restype_1to3,
             write_full_PDB,
         )
         from model_utils import ProteinMPNN
         from sc_utils import Packer, pack_side_chains
         from prody import writePDB
-        return True, (parse_PDB, featurize, get_score, alphabet, restype_int_to_str, restype_str_to_int, ProteinMPNN, write_full_PDB, Packer, pack_side_chains, writePDB)
+        return True, (parse_PDB, featurize, get_score, alphabet, restype_int_to_str, restype_str_to_int, restype_1to3, ProteinMPNN, write_full_PDB, Packer, pack_side_chains, writePDB)
     except ImportError as e:
         print(f"Error importing LigandMPNN modules: {e}")
         return False, None
@@ -297,6 +123,14 @@ def setup_pyrosetta(ligand_params_path, native_pdb_path, use_genpot=False, verbo
         init_flags = ['-beta']
         if not verbose:
             init_flags.append('-mute all')
+        
+        # Improved multithreading configuration for main process
+        # Use environment variables to determine thread count
+        pyrosetta_threads = int(os.environ.get('ROSETTA_NUM_THREADS', '4'))
+        init_flags.extend([
+            f'-multithreading:total_threads {pyrosetta_threads}',
+            f'-multithreading:interaction_graph_threads {pyrosetta_threads}'
+        ])
         
         if use_genpot:
             init_flags.extend([
@@ -335,7 +169,7 @@ class LigandMPNNFastRelax:
         if not success:
             raise RuntimeError("Failed to setup LigandMPNN")
         
-        self.parse_PDB, self.featurize, self.get_score, self.alphabet, self.restype_int_to_str, self.restype_str_to_int, self.ProteinMPNN, self.write_full_PDB, self.Packer, self.pack_side_chains, self.writePDB = modules
+        self.parse_PDB, self.featurize, self.get_score, self.alphabet, self.restype_int_to_str, self.restype_str_to_int, self.restype_1to3, self.ProteinMPNN, self.write_full_PDB, self.Packer, self.pack_side_chains, self.writePDB = modules
         
         # Load model
         self.model = self._load_ligandmpnn_model()
@@ -393,7 +227,7 @@ class LigandMPNNFastRelax:
             device=self.device,
             atom_context_num=atom_context_num,
             model_type="ligand_mpnn",
-            ligand_mpnn_use_side_chain_context=self.args.use_side_chain_context,
+            ligand_mpnn_use_side_chain_context=self.args.ligand_mpnn_use_side_chain_context,
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         model.to(self.device)
@@ -500,7 +334,9 @@ class LigandMPNNFastRelax:
             pdb_path,
             device=self.device,
             chains=[],  # Parse all chains
-            parse_all_atoms=self.args.use_side_chain_context,
+            parse_all_atoms=self.args.ligand_mpnn_use_side_chain_context or (
+                self.args.pack_side_chains and not getattr(self.args, 'repack_everything', False)
+            ),
             parse_atoms_with_zero_occupancy=False,
         )
         
@@ -543,7 +379,7 @@ class LigandMPNNFastRelax:
         feature_dict = self.featurize(
             protein_dict,
             cutoff_for_score=8.0,
-            use_atom_context=True,
+            use_atom_context=getattr(self.args, 'ligand_mpnn_use_atom_context', True),
             number_of_ligand_atoms=16,
             model_type="ligand_mpnn",
         )
@@ -642,29 +478,28 @@ class LigandMPNNFastRelax:
     def create_structure_with_sequence(self, pdb_path, sequence, S_sample, output_path):
         """
         Create structure with new sequence using LigandMPNN's write_full_PDB
-        This replaces PyRosetta threading for better compatibility
         """
         if self.args.verbose:
             print("Creating structure with new sequence using LigandMPNN...")
+        
+        # Parse PDB structure - use different parsing modes based on side chain packing
+        if self.model_sc is not None:
+            # For side chain packing, we need all atoms
+            parse_all_atoms_flag = True
+        else:
+            # For regular backbone, use standard parsing
+            parse_all_atoms_flag = False
             
-        # Parse original PDB
         protein_dict, backbone, other_atoms, icodes, _ = self.parse_PDB(
-            pdb_path,
-            device=self.device,
-            chains=[],
-            parse_all_atoms=self.args.use_side_chain_context,
-            parse_atoms_with_zero_occupancy=False,
+            pdb_path, device=self.device, chains=[],
+            parse_all_atoms=parse_all_atoms_flag,
+            parse_atoms_with_zero_occupancy=False
         )
         
-        # Update sequence in protein_dict
-        protein_dict["S"] = S_sample.unsqueeze(0) if S_sample.dim() == 1 else S_sample
-        
-        # Add chain_mask (required for featurize)
-        # Default to design all residues if not specified
+        protein_dict["S"] = S_sample.squeeze() if S_sample.dim() > 1 else S_sample
         if "chain_mask" not in protein_dict:
             protein_dict["chain_mask"] = torch.ones(len(protein_dict["R_idx"]), device=self.device)
-        
-        # Pack side chains if model is available
+
         if self.model_sc is not None:
             if self.args.verbose:
                 print("Packing side chains...")
@@ -673,51 +508,179 @@ class LigandMPNNFastRelax:
             feature_dict = self.featurize(
                 protein_dict,
                 cutoff_for_score=8.0,
-                use_atom_context=True,
+                use_atom_context=getattr(self.args, 'pack_with_ligand_context', True),
                 number_of_ligand_atoms=16,
                 model_type="ligand_mpnn",
             )
             
+            # Prepare feature dict for side chain packing (following run.py pattern)
+            import copy
+            sc_feature_dict = copy.deepcopy(feature_dict)
+            B = 1  # batch size for single sequence
+            
+            # Repeat tensors for batch processing
+            for k, v in sc_feature_dict.items():
+                if k != "S":
+                    try:
+                        num_dim = len(v.shape)
+                        if num_dim == 2:
+                            sc_feature_dict[k] = v.repeat(B, 1)
+                        elif num_dim == 3:
+                            sc_feature_dict[k] = v.repeat(B, 1, 1)
+                        elif num_dim == 4:
+                            sc_feature_dict[k] = v.repeat(B, 1, 1, 1)
+                        elif num_dim == 5:
+                            sc_feature_dict[k] = v.repeat(B, 1, 1, 1, 1)
+                    except:
+                        pass
+            
+            # Set the sequence for side chain packing
+            # Note: sc_feature_dict["S"] should have batch dimension for side chain packing
+            S_for_packing = S_sample.squeeze() if S_sample.dim() > 1 else S_sample
+            sc_feature_dict["S"] = S_for_packing.unsqueeze(0)  # Add batch dimension
+            
+            if self.args.verbose:
+                print(f"Side chain packing input: S shape={sc_feature_dict['S'].shape}")
+            
             # Pack side chains
-            feature_dict_packed = self.pack_side_chains(
-                feature_dict,
+            sc_dict = self.pack_side_chains(
+                sc_feature_dict,
                 self.model_sc,
-                num_denoising_steps=getattr(self.args, 'sc_num_denoising_steps', 3),
-                num_samples=getattr(self.args, 'sc_num_samples', 16),
-                repack_everything=getattr(self.args, 'repack_everything', False),
-                num_context_atoms=16,
+                getattr(self.args, 'sc_num_denoising_steps', 3),
+                getattr(self.args, 'sc_num_samples', 16),
+                getattr(self.args, 'repack_everything', False),
             )
             
-            if feature_dict_packed is not None:
+            if sc_dict is not None:
                 if self.args.verbose:
                     print("Side chain packing completed successfully")
-                # Update coordinates with packed side chains from the returned feature_dict
-                protein_dict["X"] = feature_dict_packed["X"]
-        
-        # Write full PDB using LigandMPNN's function
-        try:
-            self.write_full_PDB(
-                protein_dict,
-                backbone,
-                other_atoms,
-                icodes,
-                output_path,
-                args_zero_indexed=getattr(self.args, 'zero_indexed', False),
-                args_force_hetatm=getattr(self.args, 'force_hetatm', False),
-            )
-            
-            if self.args.verbose:
-                print(f"Structure with new sequence saved: {output_path}")
+                    print(f"Side chain packing output: X shape={sc_dict['X'].shape}, X_m shape={sc_dict['X_m'].shape}")
                 
-            return output_path
-            
-        except Exception as e:
+                # Use packed coordinates for write_full_PDB
+                sc_X = sc_dict["X"]
+                sc_X_m = sc_dict["X_m"]
+                
+                # Remove batch dimension if present
+                if sc_X.dim() > 3:  # Expected: [L, 14, 3], but might be [1, L, 14, 3]
+                    sc_X = sc_X.squeeze(0)
+                if sc_X_m.dim() > 2:  # Expected: [L, 14], but might be [1, L, 14]
+                    sc_X_m = sc_X_m.squeeze(0)
+                
+                if self.args.verbose:
+                    print(f"After squeeze: X shape={sc_X.shape}, X_m shape={sc_X_m.shape}")
+                
+                # Update b_factors if available
+                if "b_factors" in sc_dict:
+                    b_factors = sc_dict["b_factors"]
+                    # Remove batch dimension if present
+                    if hasattr(b_factors, 'dim') and b_factors.dim() > 2:
+                        b_factors = b_factors.squeeze(0)
+                    # Ensure b_factors is on CPU and has correct shape
+                    if hasattr(b_factors, 'cpu'):
+                        b_factors = b_factors.cpu()
+                else:
+                    b_factors = None
+                
+                # Write full PDB using LigandMPNN's function with packed coordinates
+                try:
+                    # Extract required data from protein_dict following LigandMPNN's original format
+                    X = sc_X.cpu().numpy()
+                    X_m = sc_X_m.cpu().numpy()
+                    
+                    if self.args.verbose:
+                        print(f"Final structure dimensions: X={X.shape}, X_m={X_m.shape}")
+                    
+                    # Create B-factors (use from side chain packing if available, otherwise set to 1.0)
+                    if b_factors is not None:
+                        if hasattr(b_factors, 'cpu'):
+                            b_factors_np = b_factors.cpu().numpy()
+                        else:
+                            b_factors_np = b_factors
+                        # Ensure b_factors has correct shape to match X_m
+                        if b_factors_np.ndim > 2:
+                            b_factors_np = b_factors_np.squeeze()
+                        # Ensure shapes match exactly
+                        if b_factors_np.shape != X_m.shape:
+                            if self.args.verbose:
+                                print(f"B-factors shape mismatch: {b_factors_np.shape} vs {X_m.shape}, using default")
+                            b_factors_np = np.ones_like(X_m)
+                    else:
+                        b_factors_np = np.ones_like(X_m)
+                    
+                    if self.args.verbose:
+                        print(f"B-factors final shape: {b_factors_np.shape}")
+                    
+                    # Get residue indices, chain letters, and sequence
+                    R_idx = protein_dict["R_idx"].cpu().numpy()
+                    chain_letters = protein_dict["chain_letters"]
+                    S = protein_dict["S"].cpu().numpy()
+                    
+                    # Ensure S is 1D array (remove batch dimension if present)
+                    if S.ndim > 1:
+                        S = S.squeeze()
+                    
+                    if self.args.verbose:
+                        print(f"Residue data: R_idx={R_idx.shape}, S={S.shape}, chains={len(chain_letters)}")
+                    
+                    # Handle icodes - if it's not a list, create a default list
+                    if icodes is None or not isinstance(icodes, list):
+                        icodes = ['' for _ in range(len(R_idx))]
+                    
+                    # Use LigandMPNN's write_full_PDB function with correct signature
+                    self.write_full_PDB(
+                        save_path=output_path,
+                        X=X,
+                        X_m=X_m,
+                        b_factors=b_factors_np,
+                        R_idx=R_idx,
+                        chain_letters=chain_letters,
+                        S=S,
+                        other_atoms=other_atoms,
+                        icodes=icodes,
+                        force_hetatm=getattr(self.args, 'force_hetatm', False)
+                    )
+                    if self.args.verbose:
+                        print(f"Structure with new sequence saved: {output_path}")
+                    return output_path
+                except Exception as e:
+                    if self.args.verbose:
+                        print(f"Warning: LigandMPNN write_full_PDB failed: {e}")
+                        print("Falling back to PyRosetta threading...")
+                    return self._thread_sequence_fallback(pdb_path, sequence, output_path)
+            else:
+                if self.args.verbose:
+                    print("Side chain packing failed, falling back to PyRosetta threading...")
+                return self._thread_sequence_fallback(pdb_path, sequence, output_path)
+        else:
+            # No side chain packing - use backbone coordinates like original run.py
             if self.args.verbose:
-                print(f"Warning: LigandMPNN write_full_PDB failed: {e}")
-                print("Falling back to PyRosetta threading...")
+                print("No side chain packing, using backbone coordinates...")
             
-            # Fallback to PyRosetta threading
-            return self._thread_sequence_fallback(pdb_path, sequence, output_path)
+            # Following run.py pattern for backbone-only structure creation
+            try:
+                # Convert sequence to prody format
+                seq_prody = np.array([self.restype_1to3[AA] for AA in list(sequence)])[None,].repeat(4, 1)
+                
+                # Set residue names in backbone
+                backbone.setResnames(seq_prody)
+                
+                # Set B-factors to 1.0 for all atoms
+                backbone.setBetas(np.ones_like(backbone.getBetas()))
+                
+                # Write PDB using prody
+                if other_atoms:
+                    self.writePDB(output_path, backbone + other_atoms)
+                else:
+                    self.writePDB(output_path, backbone)
+                
+                if self.args.verbose:
+                    print(f"Structure with new sequence saved: {output_path}")
+                return output_path
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"Warning: Backbone writing failed: {e}")
+                    print("Falling back to PyRosetta threading...")
+                return self._thread_sequence_fallback(pdb_path, sequence, output_path)
     
     def _thread_sequence_fallback(self, pdb_path, sequence, output_path):
         """Fallback PyRosetta threading method"""
@@ -745,146 +708,49 @@ class LigandMPNNFastRelax:
         return output_path
         
     def fast_relax_parallel(self, structure_paths, max_workers=None):
-        """
-        Perform fast relax on multiple structures using true multiprocessing
-        
-        Args:
-            structure_paths: List of PDB file paths to relax
-            max_workers: Maximum number of parallel workers
-            
-        Returns:
-            List of relaxed structure paths
-        """
         if len(structure_paths) == 1:
-            # Single structure - use direct processing to avoid overhead
-            return self._fast_relax_sequential([structure_paths[0]])
-        
-        # Get optimal worker configuration
-        worker_config = get_optimal_worker_distribution(
-            len(structure_paths), 
-            max_workers, 
-            self.args
-        )
-        optimal_workers = worker_config['optimal_workers']
-        
+            return self._fast_relax_sequential(structure_paths)
+        worker_config = get_worker_config(len(structure_paths), self.args)
+        num_processes = worker_config['num_processes']
+        pyrosetta_threads = worker_config['pyrosetta_threads']
         if self.args.verbose:
-            print(f"Starting hybrid multiprocess+PyRosetta-threaded fast relax on {len(structure_paths)} structures")
-            print("Worker configuration:")
-            print(f"  - CPU cores: {worker_config['cpu_cores']}")
-            print(f"  - Available cores: {worker_config['available_cores']}")
-            print(f"  - Strategy: {worker_config['strategy_used']}")
-            print(f"  - Threading mode: {worker_config['threading_mode']}")
-            print(f"  - Memory per worker: {worker_config['memory_per_worker_gb']:.1f} GB")
-            print(f"  - Memory limited workers: {worker_config['memory_limited_workers']}")
-            print(f"  - Optimal processes: {optimal_workers}")
-            print(f"  - PyRosetta threads per process: {worker_config['pyrosetta_threads_per_process']}")
-            print(f"  - Total effective threads: {worker_config['total_effective_threads']}")
-            print(f"  - Structures per worker: {worker_config['structures_per_worker']}")
-            print(f"  - Process efficiency: {worker_config['parallel_efficiency']:.2f}")
-            print(f"  - Hybrid efficiency: {worker_config['hybrid_efficiency']:.2f}")
+            print(f"Fast relax: {len(structure_paths)} structures, {num_processes} processes, {pyrosetta_threads} threads/process")
         
-        # Prepare worker input data with PyRosetta threading info
         worker_inputs = []
-        relaxed_paths = []
-        
         for pdb_path in structure_paths:
             relaxed_path = pdb_path.replace('/backbones/', '/relaxed/').replace('.pdb', '_relaxed.pdb')
             os.makedirs(os.path.dirname(relaxed_path), exist_ok=True)
-            relaxed_paths.append(relaxed_path)
-            
-            worker_input = (
-                pdb_path, 
-                relaxed_path, 
+            worker_inputs.append((
+                pdb_path, relaxed_path,
                 self.args.ligand_params_path,
                 self.args.use_genpot,
                 self.args.verbose,
-                worker_config['pyrosetta_threads_per_process']  # Add PyRosetta threading info
-            )
-            worker_inputs.append(worker_input)
-        
-        # Choose processing method based on worker count and user preference
-        force_multiprocessing = getattr(self.args, 'force_multiprocessing', False)
-        sequential_threshold = getattr(self.args, 'sequential_threshold', 2)
-        enable_threading = getattr(self.args, 'enable_threading_fallback', False)
-        
-        use_multiprocessing = (
-            optimal_workers > 1 and 
-            len(structure_paths) > 1 and
-            len(structure_paths) >= sequential_threshold and
-            (force_multiprocessing or optimal_workers >= 2)
-        )
-        
-        if use_multiprocessing:
-            if self.args.verbose:
-                print(f"Using multiprocessing with {optimal_workers} workers")
-            
-            # Use multiprocessing for true parallelism
-            try:
-                from multiprocessing import Pool
-                
-                start_time = time.time()
-                
-                with Pool(processes=optimal_workers) as pool:
-                    results = pool.map(fast_relax_worker, worker_inputs)
-                
-                end_time = time.time()
-                
-                # Process results
-                successful_paths = []
-                failed_count = 0
-                
-                for i, result in enumerate(results):
+                pyrosetta_threads
+            ))
+
+        successful_paths = []
+        failed_count = 0
+        try:
+            ctx = mp.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=num_processes, mp_context=ctx) as executor:
+                futures = {executor.submit(fast_relax_worker, inp): inp for inp in worker_inputs}
+                for future in as_completed(futures):
+                    result = future.result()
                     if result['success']:
                         successful_paths.append(result['output_path'])
-                        if self.args.verbose and i % max(1, len(results)//5) == 0:
-                            print(f"Completed {i+1}/{len(results)}: {os.path.basename(result['output_path'])}")
                     else:
                         failed_count += 1
                         if self.args.verbose:
                             print(f"Failed {result['input_path']}: {result['error']}")
-                        
-                        # Fallback: copy original file
-                        try:
-                            import shutil
-                            shutil.copy2(result['input_path'], result['output_path'])
-                            successful_paths.append(result['output_path'])
-                            if self.args.verbose:
-                                print(f"Using original structure as fallback: {result['output_path']}")
-                        except Exception as copy_e:
-                            if self.args.verbose:
-                                print(f"Failed to copy original file: {copy_e}")
-                            successful_paths.append(result['input_path'])
-                
-                if self.args.verbose:
-                    speedup = (len(structure_paths) * 30) / (end_time - start_time)  # Assume 30s per structure
-                    print(f"Multiprocessing completed in {end_time - start_time:.2f}s")
-                    print(f"Estimated speedup: {speedup:.1f}x")
-                    print(f"Success rate: {(len(results) - failed_count)/len(results)*100:.1f}%")
-                
-                return successful_paths
-                
-            except Exception as e:
-                if self.args.verbose:
-                    print(f"Multiprocessing failed: {e}")
-                    
-                # Try threading fallback if enabled
-                if enable_threading:
-                    if self.args.verbose:
-                        print("Attempting threading fallback...")
-                    try:
-                        return self._fast_relax_threading(structure_paths, optimal_workers)
-                    except Exception as threading_e:
-                        if self.args.verbose:
-                            print(f"Threading fallback also failed: {threading_e}")
-                
-                if self.args.verbose:
-                    print("Falling back to sequential processing...")
-                return self._fast_relax_sequential(structure_paths)
-        
-        else:
+                        import shutil; shutil.copy2(result['input_path'], result['output_path'])
+                        successful_paths.append(result['output_path'])
+            if self.args.verbose and failed_count > 0:
+                print(f"Fast relax completed: {len(successful_paths)}/{len(structure_paths)} successful")
+        except Exception as e:
             if self.args.verbose:
-                print("Using sequential processing (single worker or small batch)")
+                print(f"Multiprocessing failed: {e}, falling back to sequential")
             return self._fast_relax_sequential(structure_paths)
+        return successful_paths
     
     def _fast_relax_sequential(self, structure_paths):
         """
@@ -987,74 +853,107 @@ class LigandMPNNFastRelax:
             
         return relaxed_paths
     
-    def _fast_relax_single(self, input_pdb_path, output_pdb_path):
+    def _fast_relax_sequential(self, structure_paths):
         """
-        Perform fast relax on a single structure (with improved error handling)
+        Sequential fast relax processing (fallback method)
         """
-        try:
-            if self.args.verbose:
-                print(f"Loading pose from: {input_pdb_path}")
+        relaxed_paths = []
+        
+        for pdb_path in structure_paths:
+            relaxed_path = pdb_path.replace('/backbones/', '/relaxed/').replace('.pdb', '_relaxed.pdb')
+            os.makedirs(os.path.dirname(relaxed_path), exist_ok=True)
             
-            # Load pose with error checking
-            pose = self.pyrosetta.pose_from_pdb(input_pdb_path)
-            
-            if pose.total_residue() == 0:
-                raise ValueError("Empty pose loaded")
-            
-            if self.args.verbose:
-                print(f"Pose loaded successfully with {pose.total_residue()} residues")
-            
-            # Set up scoring function
-            scorefxn = self.get_score_function()
-            
-            # Set up FastRelax with default settings for stability
-            fr = self.FastRelax()
-            fr.set_scorefxn(scorefxn)
-            
-            # Set conservative relax settings to avoid crashes
-            fr.constrain_relax_to_start_coords(True)
-            fr.coord_constrain_sidechains(True)
-            fr.ramp_down_constraints(False)
-            
-            if self.args.verbose:
-                print("Starting fast relax...")
-            
-            # Run fast relax
-            fr.apply(pose)
-            
-            if self.args.verbose:
-                print("Fast relax completed, saving structure...")
-            
-            # Save relaxed structure
-            pose.dump_pdb(output_pdb_path)
-            
-            # Verify output file was created
-            if not os.path.exists(output_pdb_path):
-                raise RuntimeError("Output PDB file was not created")
-            
-            if self.args.verbose:
-                print(f"Relaxed structure saved to: {output_pdb_path}")
-            
-            return output_pdb_path
-            
-        except Exception as e:
-            print(f"Error in fast relax for {input_pdb_path}: {e}")
-            print(f"Traceback: {traceback.format_exc()}")
-            
-            # Try to copy original file as fallback
             try:
-                import shutil
-                shutil.copy2(input_pdb_path, output_pdb_path)
-                print(f"Using original structure as fallback: {output_pdb_path}")
-                return output_pdb_path
-            except Exception as copy_e:
-                print(f"Failed to copy original file: {copy_e}")
-                return input_pdb_path  # Return original path if everything fails
+                if self.args.verbose:
+                    print(f"Processing: {os.path.basename(pdb_path)}")
+                
+                # Load pose
+                pose = self.pyrosetta.pose_from_pdb(pdb_path)
+                if pose.total_residue() == 0:
+                    raise ValueError("Empty pose loaded")
+                
+                # Set up FastRelax
+                scorefxn = self.get_score_function()
+                fr = self.FastRelax()
+                fr.set_scorefxn(scorefxn)
+                fr.constrain_relax_to_start_coords(True)
+                fr.coord_constrain_sidechains(True)
+                fr.ramp_down_constraints(False)
+                
+                # Run FastRelax
+                fr.apply(pose)
+                
+                # Save result
+                pose.dump_pdb(relaxed_path)
+                relaxed_paths.append(relaxed_path)
+                
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"Error processing {pdb_path}: {e}")
+                
+                # Fallback: copy original file
+                try:
+                    import shutil
+                    shutil.copy2(pdb_path, relaxed_path)
+                    relaxed_paths.append(relaxed_path)
+                except Exception:
+                    relaxed_paths.append(pdb_path)
+        
+        return relaxed_paths
         
     def fast_relax(self, pose, cycles=5):
-        """Perform fast relax on pose"""
+        """Perform fast relax on pose with proper threading"""
         if self.args.verbose:
             print("Performing fast relax...")
+        
+        # CRITICAL: Reinitialize PyRosetta with threading support for main process
+        # This ensures FastRelax uses proper multithreading
+        try:
+            import pyrosetta
+            from pyrosetta.rosetta.basic.thread_manager import RosettaThreadManager
+            
+            # Set environment variables for threading
+            pyrosetta_threads = getattr(self.args, 'pyrosetta_threads', 4)
+            os.environ['OMP_NUM_THREADS'] = str(pyrosetta_threads)
+            os.environ['ROSETTA_NUM_THREADS'] = str(pyrosetta_threads)
+            
+            # Check if we need to reinitialize
+            thread_manager = RosettaThreadManager.get_instance()
+            current_threads = thread_manager.total_threads()
+            
+            if current_threads < pyrosetta_threads:
+                if self.args.verbose:
+                    print(f"Reinitializing PyRosetta with {pyrosetta_threads} threads (current: {current_threads})")
+                
+                # Finalize and reinitialize
+                pyrosetta.finalize()
+                
+                # Build new init flags with threading
+                init_flags = ['-beta']
+                if not self.args.verbose:
+                    init_flags.append('-mute all')
+                
+                init_flags.extend([
+                    f'-multithreading:total_threads {pyrosetta_threads}',
+                    f'-multithreading:interaction_graph_threads {pyrosetta_threads}',
+                    '-run:multiple_processes_writing_to_one_directory'
+                ])
+                
+                # Add ligand parameters
+                if self.args.use_genpot:
+                    init_flags.extend(['-gen_potential', f'-extra_res_fa {self.args.ligand_params_path}'])
+                else:
+                    init_flags.append(f'-extra_res_fa {self.args.ligand_params_path}')
+                
+                # Reinitialize
+                pyrosetta.init(' '.join(init_flags))
+                
+                if self.args.verbose:
+                    print(f"✓ PyRosetta reinitialized with {pyrosetta_threads} threads")
+                    
+        except Exception as e:
+            if self.args.verbose:
+                print(f"Warning: Could not reinitialize PyRosetta threading: {e}")
             
         # Set up scoring function
         scorefxn = self.get_score_function()
@@ -1373,300 +1272,12 @@ class LigandMPNNFastRelax:
             print(f"Final structure: {current_pdb}")
             
         return all_cycle_results
-            
-        return current_pdb
-    
-    def analyze_performance_improvements(self):
-        """
-        Analyze and report expected performance improvements from optimizations
-        """
-        print("\n" + "="*70)
-        print("ADVANCED PERFORMANCE ANALYSIS")
-        print("="*70)
-        
-        # Get worker configuration for analysis
-        test_structures = max(1, self.args.num_seq_per_target)
-        worker_config = get_optimal_worker_distribution(test_structures, self.args.max_relax_workers, self.args)
-        
-        print("\n1. CPU ALLOCATION STRATEGY:")
-        print(f"   - Strategy: {worker_config['strategy_used']}")
-        print(f"   - Total CPU cores: {worker_config['cpu_cores']}")
-        print(f"   - Available cores: {worker_config['available_cores']}")
-        print(f"   - Optimal workers: {worker_config['optimal_workers']}")
-        print(f"   - Memory per worker: {worker_config['memory_per_worker_gb']:.1f} GB")
-        print(f"   - Memory limited workers: {worker_config['memory_limited_workers']}")
-        
-        print("\n2. BATCH PROCESSING IMPROVEMENTS:")
-        print(f"   - Sequences per cycle: {self.args.num_seq_per_target}")
-        print(f"   - Maximum batch size: {getattr(self.args, 'max_batch_size', 8)}")
-        
-        if self.args.num_seq_per_target > 1:
-            batches_needed = (self.args.num_seq_per_target + self.args.max_batch_size - 1) // self.args.max_batch_size
-            print(f"   - Number of batches: {batches_needed}")
-            print(f"   - Expected GPU utilization improvement: ~{min(self.args.max_batch_size, self.args.num_seq_per_target)}x")
-        else:
-            print("   - Single sequence mode: No batch improvement")
-        
-        print("\n3. HYBRID MULTIPROCESSING + PYROSETTA THREADING:")
-        threading_mode = worker_config['threading_mode']
-        pyrosetta_threads = worker_config['pyrosetta_threads_per_process']
-        
-        if self.args.num_seq_per_target > 1:
-            if threading_mode == 'hybrid':
-                print("   🚀 HYBRID PARALLELISM ENABLED")
-                print("   - Python multiprocessing: True parallelism across processes")
-                print("   - PyRosetta multithreading: C++ level threading within each process")
-                print("   - No GIL limitations for both levels")
-                print(f"   - Processes: {worker_config['optimal_workers']}")
-                print(f"   - PyRosetta threads per process: {pyrosetta_threads}")
-                print(f"   - Total effective threads: {worker_config['total_effective_threads']}")
-                
-                # Calculate expected speedups
-                process_speedup = min(worker_config['optimal_workers'], self.args.num_seq_per_target)
-                thread_speedup = min(pyrosetta_threads, 2.0)  # Threading often less than linear
-                hybrid_speedup = process_speedup * thread_speedup * 0.8  # Efficiency factor
-                
-                print(f"   - Expected process speedup: ~{process_speedup:.1f}x")
-                print(f"   - Expected thread speedup per process: ~{thread_speedup:.1f}x")
-                print(f"   - Expected total hybrid speedup: ~{hybrid_speedup:.1f}x")
-                print(f"   - Hybrid efficiency: {worker_config['hybrid_efficiency']:.2f}")
-                
-            else:
-                print("   ✓ Process-only parallelism")
-                expected_speedup = min(worker_config['optimal_workers'], self.args.num_seq_per_target)
-                print("   - Process-based parallelism (no GIL limitations)")
-                print(f"   - Processes: {worker_config['optimal_workers']}")
-                print(f"   - Expected speedup: ~{expected_speedup:.1f}x per cycle")
-                print(f"   - Parallel efficiency: {worker_config['parallel_efficiency']:.2f}")
-                
-            print(f"   - Total structures per cycle: {self.args.num_seq_per_target}")
-            
-            # Memory analysis with threading consideration
-            total_memory = worker_config['optimal_workers'] * worker_config['memory_per_worker_gb']
-            if threading_mode == 'hybrid':
-                total_memory *= (1 + 0.3 * (pyrosetta_threads - 1))  # Threading overhead
-            print(f"   - Estimated memory usage: {total_memory:.1f} GB")
-            
-        else:
-            print("   - Single sequence mode: No parallel benefit")
-        
-        print("\n4. FALLBACK MECHANISMS:")
-        if getattr(self.args, 'enable_threading_fallback', False):
-            print("   ✓ Threading fallback enabled")
-            print("   - Automatic fallback if multiprocessing fails")
-            print("   - Limited by GIL but may work with PyRosetta's C++ backend")
-        else:
-            print("   - Sequential fallback only")
-            
-        if getattr(self.args, 'force_multiprocessing', False):
-            print("   ✓ Forced multiprocessing enabled")
-        
-        sequential_threshold = getattr(self.args, 'sequential_threshold', 2)
-        print(f"   - Sequential threshold: {sequential_threshold} structures")
-        
-        print("\n5. LIGANDMPNN PACKING vs PYROSETTA THREADING:")
-        if self.args.pack_side_chains:
-            print("   ✓ Using LigandMPNN native side chain packing")
-            print("   - Better ligand-protein interaction modeling")
-            print("   - Consistent with LigandMPNN training")
-            print("   - Expected accuracy improvement: High")
-        else:
-            print("   ⚠ Using PyRosetta threading (fallback mode)")
-            print("   - May have inconsistencies with LigandMPNN")
-        
-        print("\n6. OVERALL EXPECTED IMPROVEMENTS:")
-        total_sequences = self.args.num_seq_per_target * self.args.n_cycles
-        print(f"   - Total sequences across all cycles: {total_sequences}")
-        
-        if self.args.num_seq_per_target > 1:
-            batch_speedup = min(self.args.max_batch_size, self.args.num_seq_per_target)
-            parallel_speedup = min(worker_config['optimal_workers'], self.args.num_seq_per_target)
-            
-            # More sophisticated speedup calculation
-            if worker_config['parallel_efficiency'] > 0.8:
-                efficiency_factor = 1.0
-            elif worker_config['parallel_efficiency'] > 0.5:
-                efficiency_factor = 0.8
-            else:
-                efficiency_factor = 0.6
-                
-            total_speedup = (batch_speedup * 0.3 + parallel_speedup * 0.7) * efficiency_factor
-            print(f"   - Estimated total speedup: ~{total_speedup:.1f}x")
-            print(f"   - Quality improvement: High (better sampling + native packing)")
-        else:
-            print("   - Limited speedup with single sequence per cycle")
-            print("   - Quality improvement: Medium (better packing only)")
-        
-        print("\n7. RESOURCE UTILIZATION:")
-        print("   CPU Strategy Analysis:")
-        if self.args.cpu_allocation_strategy == 'conservative':
-            print("   ✓ Conservative: Good for shared systems")
-        elif self.args.cpu_allocation_strategy == 'aggressive': 
-            print("   ⚡ Aggressive: Maximum performance on dedicated systems")
-        elif self.args.cpu_allocation_strategy == 'custom':
-            print(f"   🎯 Custom: Using exactly {self.args.max_relax_workers} workers")
-        else:
-            print("   🔄 Auto: Balanced approach")
-            
-        print("\n8. BOTTLENECK ANALYSIS:")
-        print("   Previous bottlenecks:")
-        print("   - Sequential sequence generation")
-        print("   - PyRosetta threading inconsistencies") 
-        print("   - Sequential fast relax")
-        print("   - No CPU allocation strategy")
-        
-        print("\n   Current optimizations:")
-        print("   ✓ Batch sequence generation")
-        print("   ✓ Native LigandMPNN structure creation")
-        print("   ✓ True multiprocess fast relax")
-        print("   ✓ Intelligent CPU allocation")
-        print("   ✓ Memory-aware worker scaling")
-        print("   ✓ Fallback mechanisms")
-        print("   ✓ Better structure evaluation")
-        
-        print("\n9. RECOMMENDATIONS:")
-        if self.args.num_seq_per_target == 1:
-            print("   📈 Consider increasing --num_seq_per_target to 4-8 for better sampling")
-        if not self.args.pack_side_chains:
-            print("   📈 Enable --pack_side_chains for better accuracy")
-        if not getattr(self.args, 'force_multiprocessing', False) and self.args.num_seq_per_target > 3:
-            print("   📈 Consider --force_multiprocessing for guaranteed parallel processing")
-        if not getattr(self.args, 'enable_threading_fallback', False):
-            print("   📈 Consider --enable_threading_fallback for better reliability")
-        if self.args.cpu_allocation_strategy == 'auto':
-            print("   📈 Consider --cpu_allocation_strategy aggressive for dedicated systems")
-        if worker_config['memory_limited_workers'] < worker_config['optimal_workers']:
-            print(f"   ⚠️  Memory limiting workers to {worker_config['memory_limited_workers']} (consider more RAM)")
-            
-        print("\n10. HYBRID PARALLEL PROCESSING TECHNICAL DETAILS:")
-        print("   🔬 Two-Level Parallelism Architecture:")
-        print("   ")
-        print("   Level 1 - Python Multiprocessing:")
-        print("   - True parallelism across CPU cores")
-        print("   - Each process has independent PyRosetta instance")
-        print("   - No GIL limitations for CPU-intensive operations")
-        print("   - Memory isolation between processes")
-        print("   ")
-        print("   Level 2 - PyRosetta C++ Multithreading:")
-        print("   - Native C++ threading within each PyRosetta process")
-        print("   - Shared memory within process (efficient)")
-        print("   - Optimized for scientific computing workloads")
-        print("   - Can utilize vectorized operations and SIMD")
-        print("   ")
-        if getattr(self.args, 'enable_pyrosetta_threading', False):
-            print("   🚀 HYBRID MODE ACTIVE:")
-            print(f"   - {worker_config['optimal_workers']} processes × {worker_config['pyrosetta_threads_per_process']} threads")
-            print(f"   - Total computational threads: {worker_config['total_effective_threads']}")
-            print("   - Theoretical maximum speedup: Process_count × Thread_efficiency")
-            print("   - Expected efficiency: 60-85% (depends on workload characteristics)")
-        else:
-            print("   📝 PROCESS-ONLY MODE:")
-            print("   - Using Python multiprocessing only")
-            print("   - To enable hybrid mode: --enable_pyrosetta_threading")
-            
-        print("   ")
-        print("   Optimal Use Cases:")
-        print("   - Large protein structures (>200 residues)")
-        print("   - Multiple sequences per cycle (>4)")
-        print("   - Systems with 8+ CPU cores")
-        print("   - Memory-rich environments (>16GB RAM)")
-        
-        print("="*70)
-
-
-def print_usage_examples():
-    """Print usage examples for hybrid parallelism"""
-    print("\n" + "="*70)
-    print("HYBRID PARALLELISM USAGE EXAMPLES")
-    print("="*70)
-    
-    print("\n1. BASIC HYBRID MODE (Recommended):")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 8 \\")
-    print("    --hybrid_parallelism")
-    
-    print("\n2. AUTO-TUNED HYBRID MODE:")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 8 \\")
-    print("    --auto_tune_threading")
-    
-    print("\n3. CUSTOM HYBRID CONFIGURATION:")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 16 \\")
-    print("    --enable_pyrosetta_threading \\")
-    print("    --pyrosetta_threads_per_process 3 \\")
-    print("    --max_relax_workers 4 \\")
-    print("    --cpu_allocation_strategy aggressive")
-    
-    print("\n4. HIGH-PERFORMANCE MODE (16+ cores):")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 32 \\")
-    print("    --enable_pyrosetta_threading \\")
-    print("    --pyrosetta_threads_per_process 4 \\")
-    print("    --max_relax_workers 8 \\")
-    print("    --cpu_allocation_strategy aggressive \\")
-    print("    --force_multiprocessing")
-    
-    print("\n5. MEMORY-CONSTRAINED MODE:")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 8 \\")
-    print("    --enable_pyrosetta_threading \\")
-    print("    --pyrosetta_threads_per_process 2 \\")
-    print("    --max_relax_workers 2 \\")
-    print("    --memory_per_worker_gb 1.5 \\")
-    print("    --cpu_allocation_strategy conservative")
-    
-    print("\n6. DEVELOPMENT/DEBUGGING MODE:")
-    print("python ligandmpnn_fastrelax_complete.py \\")
-    print("    --pdb_path input.pdb \\")
-    print("    --ligand_params_path ligand.params \\")
-    print("    --num_seq_per_target 4 \\")
-    print("    --sequential_threshold 10 \\")
-    print("    --enable_threading_fallback \\")
-    print("    --verbose")
-    
-    print("\n" + "="*70)
-    print("PERFORMANCE EXPECTATIONS BY SYSTEM TYPE")
-    print("="*70)
-    
-    print("\n🖥️  High-End Workstation (16+ cores, 32+ GB RAM):")
-    print("   - Expected speedup: 15-25x")
-    print("   - Recommended: --auto_tune_threading")
-    print("   - Structures per cycle: 16-32")
-    
-    print("\n💻 Standard Workstation (8-16 cores, 16+ GB RAM):")
-    print("   - Expected speedup: 8-15x")
-    print("   - Recommended: --hybrid_parallelism")
-    print("   - Structures per cycle: 8-16")
-    
-    print("\n📱 Laptop/Small System (4-8 cores, 8+ GB RAM):")
-    print("   - Expected speedup: 3-6x")
-    print("   - Recommended: --enable_pyrosetta_threading")
-    print("   - Structures per cycle: 4-8")
-    
-    print("\n⚡ Cloud Instance Recommendations:")
-    print("   - AWS c5.4xlarge: --hybrid_parallelism")
-    print("   - AWS c5.9xlarge: --auto_tune_threading") 
-    print("   - Google Cloud c2-standard-16: --aggressive strategy")
-    
-    print("="*70)
-
 
 def estimate_performance_improvement(args):
     """Estimate performance improvement for given configuration"""
     # Get worker configuration
     test_structures = max(1, args.num_seq_per_target)
-    worker_config = get_optimal_worker_distribution(test_structures, args.max_relax_workers, args)
+    worker_config = get_worker_config(test_structures, args)
     
     # Baseline (sequential processing)
     baseline_time_per_structure = 30  # seconds (typical FastRelax time)
@@ -1690,10 +1301,9 @@ def estimate_performance_improvement(args):
         'speedup_factor': total_speedup,
         'efficiency_percent': (time_saved / baseline_total_time) * 100
     }
-    
+
 
 def parse_arguments():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='LigandMPNN FastRelax - Complete Version')
     
     # Input/Output
@@ -1737,37 +1347,24 @@ def parse_arguments():
     # LigandMPNN settings
     parser.add_argument('--use_side_chain_context', action='store_true',
                         help='Use side chain context in LigandMPNN')
+    parser.add_argument('--ligand_mpnn_use_side_chain_context', type=int, default=0,
+                        help='Use side chain context in LigandMPNN')
+    parser.add_argument('--ligand_mpnn_use_atom_context', type=int, default=1,
+                        help='Use atom context in LigandMPNN')
     parser.add_argument('--pack_side_chains', action='store_true', default=False,
                         help='Use LigandMPNN side chain packing')
     parser.add_argument('--checkpoint_path_sc', type=str, default=None,
                         help='Path to side chain packer model')
+    parser.add_argument('--pack_with_ligand_context', type=int, default=1,
+                        help='Use ligand context during side chain packing')
     
     # Batch processing and parallelization
     parser.add_argument('--max_batch_size', type=int, default=8,
                         help='Maximum batch size for sequence generation')
-    parser.add_argument('--max_relax_workers', type=int, default=None,
-                        help='Maximum number of parallel workers for fast relax')
-    parser.add_argument('--force_multiprocessing', action='store_true',
-                        help='Force multiprocessing even for small batches')
-    parser.add_argument('--cpu_allocation_strategy', type=str, default='auto',
-                        choices=['auto', 'conservative', 'aggressive', 'custom'],
-                        help='Strategy for CPU allocation: auto (default), conservative (use 50%% cores), aggressive (use 90%% cores), custom (use exact max_relax_workers)')
-    parser.add_argument('--memory_per_worker_gb', type=float, default=2.0,
-                        help='Estimated memory per worker in GB (for memory-based worker limiting)')
-    parser.add_argument('--enable_threading_fallback', action='store_true',
-                        help='Enable threading fallback if multiprocessing fails')
-    parser.add_argument('--sequential_threshold', type=int, default=2,
-                        help='Use sequential processing if structure count is below this threshold')
-    
-    # PyRosetta multithreading options
-    parser.add_argument('--enable_pyrosetta_threading', action='store_true',
-                        help='Enable PyRosetta internal multithreading within each process')
-    parser.add_argument('--pyrosetta_threads_per_process', type=int, default=2,
-                        help='Number of threads per PyRosetta process (only used if --enable_pyrosetta_threading)')
-    parser.add_argument('--hybrid_parallelism', action='store_true',
-                        help='Enable hybrid parallelism: Python multiprocessing + PyRosetta multithreading')
-    parser.add_argument('--auto_tune_threading', action='store_true',
-                        help='Automatically tune the process/thread ratio based on system capabilities')
+    parser.add_argument('--num_processes', type=int, default=4,
+                        help='Number of processes for fast relax (default: 4)')
+    parser.add_argument('--pyrosetta_threads', type=int, default=4,
+                        help='Number of threads per PyRosetta process (default: 4)')
     
     # Side chain packing parameters
     parser.add_argument('--number_of_packs_per_design', type=int, default=1,
@@ -1778,8 +1375,8 @@ def parse_arguments():
                         help='Number of samples for side chain packing')
     parser.add_argument('--repack_everything', action='store_true',
                         help='Repack all residues (not just designed ones)')
-    parser.add_argument('--pack_with_ligand_context', action='store_true', default=True,
-                        help='Use ligand context during side chain packing')
+    # parser.add_argument('--pack_with_ligand_context', action='store_true', default=True,
+    #                     help='Use ligand context during side chain packing')
     parser.add_argument('--force_hetatm', action='store_true',
                         help='Force ligand atoms to be written as HETATM')
     parser.add_argument('--zero_indexed', action='store_true',
@@ -1808,10 +1405,7 @@ def parse_arguments():
 
 
 def main():
-    """Main function"""
     args = parse_arguments()
-    
-    # Set random seed if provided
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
@@ -1819,31 +1413,10 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed(args.seed)
             torch.cuda.manual_seed_all(args.seed)
-    
     try:
-        # Create LigandMPNN FastRelax instance
+        mp.freeze_support()
+        mp.set_start_method('spawn', force=True)
         mpnn_fr = LigandMPNNFastRelax(args)
-        
-        # Show performance analysis
-        if args.verbose:
-            mpnn_fr.analyze_performance_improvements()
-            
-            # Show usage examples if using hybrid mode
-            if (getattr(args, 'enable_pyrosetta_threading', False) or 
-                getattr(args, 'hybrid_parallelism', False) or 
-                getattr(args, 'auto_tune_threading', False)):
-                print_usage_examples()
-            
-            # Estimate performance improvement
-            perf_estimate = estimate_performance_improvement(args)
-            print(f"\n📊 ESTIMATED PERFORMANCE FOR THIS RUN:")
-            print(f"   - Baseline time: {perf_estimate['baseline_time_minutes']:.1f} minutes")
-            print(f"   - Expected time: {perf_estimate['improved_time_minutes']:.1f} minutes")  
-            print(f"   - Time saved: {perf_estimate['time_saved_minutes']:.1f} minutes")
-            print(f"   - Speedup factor: {perf_estimate['speedup_factor']:.1f}x")
-            print(f"   - Efficiency gain: {perf_estimate['efficiency_percent']:.1f}%")
-        
-        # Run iterative design
         cycle_results = mpnn_fr.run_iterative_design()
         
         # Get final structure from last cycle
@@ -1869,12 +1442,9 @@ def main():
         
     except Exception as e:
         print(f"Error during iterative design: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return 1
-        
     return 0
-
 
 if __name__ == "__main__":
     exit(main())
