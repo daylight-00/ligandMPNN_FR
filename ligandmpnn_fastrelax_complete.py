@@ -176,14 +176,25 @@ class LigandMPNNFastRelax:
         
         # Load side chain packing model if enabled
         self.model_sc = None
-        if getattr(args, 'pack_side_chains', False):  # Disable by default to avoid loading issues
+        if getattr(args, 'pack_side_chains', False):
             try:
+                if args.verbose:
+                    print("Loading side chain packing model...")
                 self.model_sc = self._load_packer_model()
+                if self.model_sc is not None:
+                    if args.verbose:
+                        print("Side chain packing model loaded successfully!")
+                else:
+                    if args.verbose:
+                        print("Side chain packing model failed to load!")
             except Exception as e:
                 if args.verbose:
                     print(f"Warning: Could not load side chain packer: {e}")
                     print("Side chain packing will be disabled")
                 self.model_sc = None
+        else:
+            if args.verbose:
+                print("Side chain packing is disabled (pack_side_chains=False)")
         
         # Setup PyRosetta
         success, modules = setup_pyrosetta(
@@ -204,9 +215,16 @@ class LigandMPNNFastRelax:
         """Load LigandMPNN model (robust path handling like run.py)"""
         checkpoint_path = self.args.checkpoint_path
         if not checkpoint_path:
-            model_folder = self.args.path_to_model_weights if hasattr(self.args, 'path_to_model_weights') else './model_params/'
-            if model_folder[-1] != '/':
-                model_folder += '/'
+            # Handle path_to_model_weights properly
+            if hasattr(self.args, 'path_to_model_weights') and self.args.path_to_model_weights:
+                model_folder = self.args.path_to_model_weights
+                if model_folder[-1] != '/':
+                    model_folder += '/'
+                # If the path doesn't end with model_params/, add it
+                if not model_folder.endswith('model_params/'):
+                    model_folder += 'model_params/'
+            else:
+                model_folder = './model_params/'
             checkpoint_path = f"{model_folder}{getattr(self.args, 'model_name', 'ligandmpnn_v_32_010_25')}.pt"
         if not isinstance(checkpoint_path, str) or not checkpoint_path:
             raise ValueError("Could not determine checkpoint_path for LigandMPNN model.")
@@ -244,7 +262,7 @@ class LigandMPNNFastRelax:
             model_folder = getattr(self.args, 'path_to_model_weights', '/home/hwjang/aipd/LigandMPNN/')
             if model_folder[-1] != '/':
                 model_folder += '/'
-            checkpoint_path_sc = f"{model_folder}model_params/ligandmpnn_sc_v_32_002_16.pt"
+            checkpoint_path_sc = f"{model_folder}ligandmpnn_sc_v_32_002_16.pt"
         
         # Validate checkpoint path
         if not checkpoint_path_sc or not isinstance(checkpoint_path_sc, str):
@@ -478,34 +496,36 @@ class LigandMPNNFastRelax:
     def create_structure_with_sequence(self, pdb_path, sequence, S_sample, output_path):
         """
         Create structure with new sequence using LigandMPNN's write_full_PDB
+        Following run.py pattern closely for proper side chain packing
         """
         if self.args.verbose:
             print("Creating structure with new sequence using LigandMPNN...")
         
         # Parse PDB structure - use different parsing modes based on side chain packing
-        if self.model_sc is not None:
-            # For side chain packing, we need all atoms
-            parse_all_atoms_flag = True
-        else:
-            # For regular backbone, use standard parsing
-            parse_all_atoms_flag = False
-            
+        parse_all_atoms_flag = (
+            self.args.ligand_mpnn_use_side_chain_context or (
+                self.args.pack_side_chains and not getattr(self.args, 'repack_everything', False)
+            )
+        )
+        
         protein_dict, backbone, other_atoms, icodes, _ = self.parse_PDB(
             pdb_path, device=self.device, chains=[],
             parse_all_atoms=parse_all_atoms_flag,
             parse_atoms_with_zero_occupancy=False
         )
         
+        # Set the sequence in protein_dict
         protein_dict["S"] = S_sample.squeeze() if S_sample.dim() > 1 else S_sample
         if "chain_mask" not in protein_dict:
             protein_dict["chain_mask"] = torch.ones(len(protein_dict["R_idx"]), device=self.device)
 
-        if self.model_sc is not None:
+        # Check if side chain packing is enabled and model is loaded
+        if self.args.pack_side_chains and self.model_sc is not None:
             if self.args.verbose:
                 print("Packing side chains...")
             
-            # Featurize for side chain packing
-            feature_dict = self.featurize(
+            # Featurize for side chain packing following run.py pattern
+            feature_dict_ = self.featurize(
                 protein_dict,
                 cutoff_for_score=8.0,
                 use_atom_context=getattr(self.args, 'pack_with_ligand_context', True),
@@ -513,12 +533,12 @@ class LigandMPNNFastRelax:
                 model_type="ligand_mpnn",
             )
             
-            # Prepare feature dict for side chain packing (following run.py pattern)
+            # Prepare feature dict for side chain packing (following run.py pattern exactly)
             import copy
-            sc_feature_dict = copy.deepcopy(feature_dict)
+            sc_feature_dict = copy.deepcopy(feature_dict_)
             B = 1  # batch size for single sequence
             
-            # Repeat tensors for batch processing
+            # Repeat tensors for batch processing (following run.py pattern)
             for k, v in sc_feature_dict.items():
                 if k != "S":
                     try:
@@ -535,152 +555,116 @@ class LigandMPNNFastRelax:
                         pass
             
             # Set the sequence for side chain packing
-            # Note: sc_feature_dict["S"] should have batch dimension for side chain packing
+            # S_sample should be unsqueezed to add batch dimension
             S_for_packing = S_sample.squeeze() if S_sample.dim() > 1 else S_sample
             sc_feature_dict["S"] = S_for_packing.unsqueeze(0)  # Add batch dimension
             
             if self.args.verbose:
                 print(f"Side chain packing input: S shape={sc_feature_dict['S'].shape}")
             
-            # Pack side chains
-            sc_dict = self.pack_side_chains(
-                sc_feature_dict,
-                self.model_sc,
-                getattr(self.args, 'sc_num_denoising_steps', 3),
-                getattr(self.args, 'sc_num_samples', 16),
-                getattr(self.args, 'repack_everything', False),
-            )
-            
-            if sc_dict is not None:
-                if self.args.verbose:
-                    print("Side chain packing completed successfully")
-                    print(f"Side chain packing output: X shape={sc_dict['X'].shape}, X_m shape={sc_dict['X_m'].shape}")
+            # Pack side chains using LigandMPNN's pack_side_chains function
+            try:
+                sc_dict = self.pack_side_chains(
+                    sc_feature_dict,
+                    self.model_sc,
+                    getattr(self.args, 'sc_num_denoising_steps', 3),
+                    getattr(self.args, 'sc_num_samples', 16),
+                    getattr(self.args, 'repack_everything', False),
+                )
                 
-                # Use packed coordinates for write_full_PDB
-                sc_X = sc_dict["X"]
-                sc_X_m = sc_dict["X_m"]
-                
-                # Remove batch dimension if present
-                if sc_X.dim() > 3:  # Expected: [L, 14, 3], but might be [1, L, 14, 3]
-                    sc_X = sc_X.squeeze(0)
-                if sc_X_m.dim() > 2:  # Expected: [L, 14], but might be [1, L, 14]
-                    sc_X_m = sc_X_m.squeeze(0)
-                
-                if self.args.verbose:
-                    print(f"After squeeze: X shape={sc_X.shape}, X_m shape={sc_X_m.shape}")
-                
-                # Update b_factors if available
-                if "b_factors" in sc_dict:
-                    b_factors = sc_dict["b_factors"]
+                if sc_dict is not None:
+                    if self.args.verbose:
+                        print("Side chain packing completed successfully")
+                        print(f"Side chain packing output: X shape={sc_dict['X'].shape}, X_m shape={sc_dict['X_m'].shape}")
+                    
+                    # Extract packed coordinates
+                    X_packed = sc_dict["X"]
+                    X_m_packed = sc_dict["X_m"]
+                    
                     # Remove batch dimension if present
-                    if hasattr(b_factors, 'dim') and b_factors.dim() > 2:
-                        b_factors = b_factors.squeeze(0)
-                    # Ensure b_factors is on CPU and has correct shape
-                    if hasattr(b_factors, 'cpu'):
-                        b_factors = b_factors.cpu()
-                else:
-                    b_factors = None
-                
-                # Write full PDB using LigandMPNN's function with packed coordinates
-                try:
-                    # Extract required data from protein_dict following LigandMPNN's original format
-                    X = sc_X.cpu().numpy()
-                    X_m = sc_X_m.cpu().numpy()
+                    if X_packed.dim() > 3:  # Expected: [L, 14, 3], but might be [1, L, 14, 3]
+                        X_packed = X_packed.squeeze(0)
+                    if X_m_packed.dim() > 2:  # Expected: [L, 14], but might be [1, L, 14]
+                        X_m_packed = X_m_packed.squeeze(0)
                     
                     if self.args.verbose:
-                        print(f"Final structure dimensions: X={X.shape}, X_m={X_m.shape}")
+                        print(f"After squeeze: X shape={X_packed.shape}, X_m shape={X_m_packed.shape}")
                     
-                    # Create B-factors (use from side chain packing if available, otherwise set to 1.0)
-                    if b_factors is not None:
-                        if hasattr(b_factors, 'cpu'):
-                            b_factors_np = b_factors.cpu().numpy()
-                        else:
-                            b_factors_np = b_factors
-                        # Ensure b_factors has correct shape to match X_m
-                        if b_factors_np.ndim > 2:
-                            b_factors_np = b_factors_np.squeeze()
-                        # Ensure shapes match exactly
-                        if b_factors_np.shape != X_m.shape:
-                            if self.args.verbose:
-                                print(f"B-factors shape mismatch: {b_factors_np.shape} vs {X_m.shape}, using default")
-                            b_factors_np = np.ones_like(X_m)
+                    # Handle b_factors
+                    if "b_factors" in sc_dict:
+                        b_factors = sc_dict["b_factors"]
+                        if hasattr(b_factors, 'dim') and b_factors.dim() > 2:
+                            b_factors = b_factors.squeeze(0)
+                        if hasattr(b_factors, 'detach'):
+                            b_factors = b_factors.detach().cpu().numpy()
+                        elif hasattr(b_factors, 'cpu'):
+                            b_factors = b_factors.cpu().numpy()
                     else:
-                        b_factors_np = np.ones_like(X_m)
+                        b_factors = np.ones_like(X_m_packed.detach().cpu().numpy())
                     
-                    if self.args.verbose:
-                        print(f"B-factors final shape: {b_factors_np.shape}")
-                    
-                    # Get residue indices, chain letters, and sequence
-                    R_idx = protein_dict["R_idx"].cpu().numpy()
-                    chain_letters = protein_dict["chain_letters"]
-                    S = protein_dict["S"].cpu().numpy()
-                    
-                    # Ensure S is 1D array (remove batch dimension if present)
-                    if S.ndim > 1:
-                        S = S.squeeze()
-                    
-                    if self.args.verbose:
-                        print(f"Residue data: R_idx={R_idx.shape}, S={S.shape}, chains={len(chain_letters)}")
-                    
-                    # Handle icodes - if it's not a list, create a default list
-                    if icodes is None or not isinstance(icodes, list):
-                        icodes = ['' for _ in range(len(R_idx))]
-                    
-                    # Use LigandMPNN's write_full_PDB function with correct signature
+                    # Write full PDB using LigandMPNN's function with packed coordinates
                     self.write_full_PDB(
                         save_path=output_path,
-                        X=X,
-                        X_m=X_m,
-                        b_factors=b_factors_np,
-                        R_idx=R_idx,
-                        chain_letters=chain_letters,
-                        S=S,
+                        X=X_packed.detach().cpu().numpy(),
+                        X_m=X_m_packed.detach().cpu().numpy(),
+                        b_factors=b_factors,
+                        R_idx=protein_dict["R_idx"].cpu().numpy(),
+                        chain_letters=protein_dict["chain_letters"],
+                        S=protein_dict["S"].cpu().numpy(),
                         other_atoms=other_atoms,
                         icodes=icodes,
                         force_hetatm=getattr(self.args, 'force_hetatm', False)
                     )
+                    
                     if self.args.verbose:
-                        print(f"Structure with new sequence saved: {output_path}")
+                        print(f"Structure with packed side chains saved: {output_path}")
                     return output_path
-                except Exception as e:
+                else:
                     if self.args.verbose:
-                        print(f"Warning: LigandMPNN write_full_PDB failed: {e}")
-                        print("Falling back to PyRosetta threading...")
-                    return self._thread_sequence_fallback(pdb_path, sequence, output_path)
-            else:
+                        print("Side chain packing failed, falling back to backbone-only structure...")
+                    # Fall through to backbone-only writing
+                    
+            except Exception as e:
                 if self.args.verbose:
-                    print("Side chain packing failed, falling back to PyRosetta threading...")
-                return self._thread_sequence_fallback(pdb_path, sequence, output_path)
+                    print(f"Warning: Side chain packing failed: {e}")
+                    print("Falling back to backbone-only structure...")
+                # Fall through to backbone-only writing
         else:
             # No side chain packing - use backbone coordinates like original run.py
             if self.args.verbose:
-                print("No side chain packing, using backbone coordinates...")
-            
-            # Following run.py pattern for backbone-only structure creation
-            try:
-                # Convert sequence to prody format
-                seq_prody = np.array([self.restype_1to3[AA] for AA in list(sequence)])[None,].repeat(4, 1)
-                
-                # Set residue names in backbone
-                backbone.setResnames(seq_prody)
-                
-                # Set B-factors to 1.0 for all atoms
-                backbone.setBetas(np.ones_like(backbone.getBetas()))
-                
-                # Write PDB using prody
-                if other_atoms:
-                    self.writePDB(output_path, backbone + other_atoms)
+                if not self.args.pack_side_chains:
+                    print("Side chain packing disabled, using backbone coordinates...")
+                elif self.model_sc is None:
+                    print("Side chain packer model not loaded, using backbone coordinates...")
                 else:
-                    self.writePDB(output_path, backbone)
-                
-                if self.args.verbose:
-                    print(f"Structure with new sequence saved: {output_path}")
-                return output_path
-            except Exception as e:
-                if self.args.verbose:
-                    print(f"Warning: Backbone writing failed: {e}")
-                    print("Falling back to PyRosetta threading...")
-                return self._thread_sequence_fallback(pdb_path, sequence, output_path)
+                    print("No side chain packing, using backbone coordinates...")
+        
+        # Backbone-only structure creation (following run.py pattern)
+        try:
+            # Convert sequence to prody format following run.py pattern
+            seq_prody = np.array([self.restype_1to3[AA] for AA in list(sequence)])[None,].repeat(4, 1)
+            
+            # Set residue names in backbone
+            backbone.setResnames(seq_prody)
+            
+            # Set B-factors to 1.0 for all atoms
+            backbone.setBetas(np.ones_like(backbone.getBetas()))
+            
+            # Write PDB using prody (following run.py pattern)
+            if other_atoms:
+                self.writePDB(output_path, backbone + other_atoms)
+            else:
+                self.writePDB(output_path, backbone)
+            
+            if self.args.verbose:
+                print(f"Structure with new sequence saved: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            if self.args.verbose:
+                print(f"Warning: Backbone writing failed: {e}")
+                print("Falling back to PyRosetta threading...")
+            return self._thread_sequence_fallback(pdb_path, sequence, output_path)
     
     def _thread_sequence_fallback(self, pdb_path, sequence, output_path):
         """Fallback PyRosetta threading method"""
@@ -707,7 +691,7 @@ class LigandMPNNFastRelax:
             
         return output_path
         
-    def fast_relax_parallel(self, structure_paths, max_workers=None):
+    def fast_relax_parallel(self, structure_paths):
         if len(structure_paths) == 1:
             return self._fast_relax_sequential(structure_paths)
         worker_config = get_worker_config(len(structure_paths), self.args)
@@ -751,107 +735,6 @@ class LigandMPNNFastRelax:
                 print(f"Multiprocessing failed: {e}, falling back to sequential")
             return self._fast_relax_sequential(structure_paths)
         return successful_paths
-    
-    def _fast_relax_sequential(self, structure_paths):
-        """
-        Sequential fast relax processing (fallback method)
-        """
-        if self.args.verbose:
-            print(f"Starting sequential fast relax on {len(structure_paths)} structures")
-        
-        relaxed_paths = []
-        
-        for i, pdb_path in enumerate(structure_paths):
-            relaxed_path = pdb_path.replace('/backbones/', '/relaxed/').replace('.pdb', '_relaxed.pdb')
-            os.makedirs(os.path.dirname(relaxed_path), exist_ok=True)
-            
-            if self.args.verbose:
-                print(f"Processing {i+1}/{len(structure_paths)}: {os.path.basename(pdb_path)}")
-            
-            try:
-                result_path = self._fast_relax_single(pdb_path, relaxed_path)
-                relaxed_paths.append(result_path)
-                if self.args.verbose:
-                    print(f"Completed fast relax: {os.path.basename(result_path)}")
-            except Exception as e:
-                print(f"Error in fast relax for {pdb_path}: {e}")
-                # Copy original file as fallback
-                import shutil
-                try:
-                    shutil.copy2(pdb_path, relaxed_path)
-                    relaxed_paths.append(relaxed_path)
-                    print(f"Using original structure as fallback: {relaxed_path}")
-                except Exception as copy_e:
-                    print(f"Failed to copy original file: {copy_e}")
-                    relaxed_paths.append(pdb_path)
-        
-        return relaxed_paths
-    
-    def _fast_relax_threading(self, structure_paths, max_workers):
-        """
-        Threading-based fast relax (may have limitations due to GIL but can work with PyRosetta)
-        This is a fallback when multiprocessing fails
-        """
-        if self.args.verbose:
-            print(f"Starting threaded fast relax on {len(structure_paths)} structures with {max_workers} threads")
-            print("Note: Threading has GIL limitations but may work with PyRosetta's C++ backend")
-        
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        relaxed_paths = []
-        
-        # Prepare path mappings
-        path_mappings = []
-        for pdb_path in structure_paths:
-            relaxed_path = pdb_path.replace('/backbones/', '/relaxed/').replace('.pdb', '_relaxed.pdb')
-            os.makedirs(os.path.dirname(relaxed_path), exist_ok=True)
-            path_mappings.append((pdb_path, relaxed_path))
-            relaxed_paths.append(relaxed_path)
-        
-        # Create a thread-safe method wrapper
-        def thread_safe_relax(pdb_path, output_path):
-            try:
-                return self._fast_relax_single(pdb_path, output_path)
-            except Exception as e:
-                if self.args.verbose:
-                    print(f"Thread error for {pdb_path}: {e}")
-                # Fallback: copy original file
-                try:
-                    import shutil
-                    shutil.copy2(pdb_path, output_path)
-                    return output_path
-                except Exception:
-                    return pdb_path
-        
-        start_time = time.time()
-        
-        # Use ThreadPoolExecutor for threading
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_path = {
-                executor.submit(thread_safe_relax, pdb_path, relaxed_path): (pdb_path, relaxed_path)
-                for pdb_path, relaxed_path in path_mappings
-            }
-            
-            # Process completed tasks
-            completed_count = 0
-            for future in as_completed(future_to_path):
-                pdb_path, relaxed_path = future_to_path[future]
-                try:
-                    result_path = future.result()
-                    completed_count += 1
-                    if self.args.verbose and completed_count % max(1, len(structure_paths)//5) == 0:
-                        print(f"Thread completed {completed_count}/{len(structure_paths)}: {os.path.basename(result_path)}")
-                except Exception as e:
-                    if self.args.verbose:
-                        print(f"Thread exception for {pdb_path}: {e}")
-        
-        end_time = time.time()
-        
-        if self.args.verbose:
-            print(f"Threading completed in {end_time - start_time:.2f}s")
-            
-        return relaxed_paths
     
     def _fast_relax_sequential(self, structure_paths):
         """
@@ -1273,36 +1156,6 @@ class LigandMPNNFastRelax:
             
         return all_cycle_results
 
-def estimate_performance_improvement(args):
-    """Estimate performance improvement for given configuration"""
-    # Get worker configuration
-    test_structures = max(1, args.num_seq_per_target)
-    worker_config = get_worker_config(test_structures, args)
-    
-    # Baseline (sequential processing)
-    baseline_time_per_structure = 30  # seconds (typical FastRelax time)
-    baseline_total_time = test_structures * baseline_time_per_structure
-    
-    # Calculate improved time
-    if worker_config['threading_mode'] == 'hybrid':
-        process_speedup = worker_config['optimal_workers']
-        thread_speedup = worker_config['pyrosetta_threads_per_process'] * 0.7  # Thread efficiency
-        total_speedup = process_speedup * thread_speedup * 0.85  # System efficiency
-    else:
-        total_speedup = worker_config['optimal_workers'] * 0.9  # Process-only efficiency
-    
-    improved_time = baseline_total_time / total_speedup
-    time_saved = baseline_total_time - improved_time
-    
-    return {
-        'baseline_time_minutes': baseline_total_time / 60,
-        'improved_time_minutes': improved_time / 60,
-        'time_saved_minutes': time_saved / 60,
-        'speedup_factor': total_speedup,
-        'efficiency_percent': (time_saved / baseline_total_time) * 100
-    }
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser(description='LigandMPNN FastRelax - Complete Version')
     
@@ -1406,6 +1259,11 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    
+    # Map the --use_side_chain_context flag to the ligand_mpnn_use_side_chain_context attribute
+    if hasattr(args, 'use_side_chain_context') and args.use_side_chain_context:
+        args.ligand_mpnn_use_side_chain_context = 1
+    
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
