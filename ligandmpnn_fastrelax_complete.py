@@ -202,28 +202,22 @@ def fast_relax_worker(input_data):
 
 
 def get_worker_config(num_structures, args):
-    # Calculate optimal configuration for better performance while preventing oversubscription
     available_cores = cpu_count()
-    max_processes = getattr(args, 'num_processes', min(6, available_cores))
-    
-    # For small numbers of structures, use conservative settings
-    if num_structures < 2:
-        num_processes = 1
-        pyrosetta_threads = 2  # Allow some threading for single structures
-    else:
-        # Use more aggressive settings now that constraints work properly
-        num_processes = min(max_processes, num_structures, available_cores // 3)  # Leave some cores free
-        # Allow 2-3 threads per process for better performance (but not too many)
-        pyrosetta_threads = min(3, max(1, available_cores // num_processes))
-        
-    if args.verbose:
-        print(f"Worker config: {num_processes} processes, {pyrosetta_threads} threads/process")
-        print(f"Total threads: {num_processes * pyrosetta_threads}, Available cores: {available_cores}")
-    
+    num_processes = min(
+        getattr(args, 'num_processes', 1),
+        num_structures,
+        available_cores
+    )
+    pyrosetta_threads = getattr(args, 'pyrosetta_threads', 2)
+    total_threads = num_processes * pyrosetta_threads
+    if total_threads > available_cores:
+        print(f"Warning: total threads ({total_threads}) exceed available CPU cores ({available_cores}). "
+              "This may cause oversubscription and reduce performance.")
     return {
         'num_processes': num_processes,
         'pyrosetta_threads': pyrosetta_threads
     }
+
 
 def setup_ligandmpnn():
     """Setup LigandMPNN model and dependencies"""
@@ -1124,7 +1118,8 @@ class LigandMPNNFastRelax:
             
         return all_cycle_results
 
-def parse_arguments():
+def parse_arguments(args=None):
+    import argparse
     parser = argparse.ArgumentParser(description='LigandMPNN FastRelax - Complete Version')
     
     # Input/Output
@@ -1225,11 +1220,12 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
-def main():
-    args = parse_arguments()
+def main(args=None):
+    if args is None:
+        args = parse_arguments()
     
     # Map the --use_side_chain_context flag to the ligand_mpnn_use_side_chain_context attribute
     if hasattr(args, 'use_side_chain_context') and args.use_side_chain_context:
