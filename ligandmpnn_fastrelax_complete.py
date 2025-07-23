@@ -19,34 +19,46 @@ from multiprocessing import cpu_count
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 
+# Import XML templates and constraint generation
+from xml_relax_after_ligMPNN import XML_BSITE_FASTRELAX
+from gen_prot_lig_dist_cst import extract_dist_cst_from_pdb
+
 # Global function for multiprocessing - must be at module level
 def fast_relax_worker(input_data):
     """
-    Worker function for multiprocessing fast relax
-    Each process gets its own PyRosetta instance and uses PyRosetta's internal threading
+    Worker function for multiprocessing fast relax with simplified XML-based protocol
+    Each process gets its own PyRosetta instance and uses minimal threading
+    Extracts key metrics: ddg, cms, totalscore
     """
-    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads = input_data
+    import os
+    import tempfile
+    
+    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads, repackable_res, target_atm_for_cst = input_data
     try:
         import pyrosetta
-        from pyrosetta.rosetta.protocols.relax import FastRelax
-        from pyrosetta.rosetta.core.scoring import get_score_function
+        from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
+        import tempfile
+        import os
 
-        # Build init flags
-        init_flags = ['-beta']
-        if not verbose:
-            init_flags.append('-mute all')
-        if pyrosetta_threads > 1:
-            init_flags.extend([
-                f'-multithreading:total_threads {pyrosetta_threads}',
-                f'-multithreading:interaction_graph_threads {pyrosetta_threads}',
-                '-run:multiple_processes_writing_to_one_directory'
-            ])
+        # Improved init flags - use flexible threading
+        init_flags = ['-beta', '-mute all']  # Always mute to reduce log spam
+        
+        # Use configured number of threads per process (now allowing more than 1)
+        init_flags.extend([
+            f'-multithreading:total_threads {pyrosetta_threads}',
+            f'-multithreading:interaction_graph_threads {pyrosetta_threads}'
+        ])
+        
+        # Add ligand parameters
         if use_genpot:
             init_flags.extend(['-gen_potential', f'-extra_res_fa {ligand_params_path}'])
         else:
             init_flags.append(f'-extra_res_fa {ligand_params_path}')
+            
+        # Add native structure for coordinate constraints
+        init_flags.append(f'-in:file:native {pdb_path}')
 
-        # Initialize PyRosetta with a single options string
+        # Initialize PyRosetta
         pyrosetta.init(' '.join(init_flags))
 
         # Load pose
@@ -54,32 +66,160 @@ def fast_relax_worker(input_data):
         if pose.total_residue() == 0:
             raise ValueError("Empty pose loaded")
 
-        # Setup and run FastRelax
-        scorefxn = get_score_function()
-        fr = FastRelax()
-        fr.set_scorefxn(scorefxn)
-        fr.constrain_relax_to_start_coords(True)
-        fr.coord_constrain_sidechains(True)
-        fr.ramp_down_constraints(False)
-        fr.apply(pose)
+        # Generate distance constraints if target atoms specified
+        cst_file_path = None
+        if target_atm_for_cst:
+            try:
+                target_atoms = target_atm_for_cst.split(',') if isinstance(target_atm_for_cst, str) else target_atm_for_cst
+                if target_atoms and target_atoms != ['']:
+                    # Generate constraints
+                    if verbose:
+                        print(f"Generating constraints for atoms: {target_atoms}")
+                    csts = extract_dist_cst_from_pdb(pdb_path, target_atoms, bsite_res=repackable_res)
+                    if csts:
+                        # Create temporary constraint file
+                        cst_fd, cst_file_path = tempfile.mkstemp(suffix='.cst', text=True)
+                        with os.fdopen(cst_fd, 'w') as f:
+                            f.write('\n'.join(csts) + '\n')
+                        if verbose:
+                            print(f"Created constraint file with {len(csts)} constraints")
+                    else:
+                        if verbose:
+                            print("No constraints generated")
+                else:
+                    if verbose:
+                        print("Empty target atoms, skipping constraint generation")
+            except Exception as e:
+                if verbose:
+                    print(f"Error generating constraints: {e}")
+                    print(f"target_atm_for_cst: {repr(target_atm_for_cst)}")
+                    print(f"target_atoms: {repr(target_atoms) if 'target_atoms' in locals() else 'not defined'}")
+                # Continue with empty constraint file
+                pass
+
+        # If no constraint file, create empty temp file
+        if cst_file_path is None:
+            cst_fd, cst_file_path = tempfile.mkstemp(suffix='.cst', text=True)
+            with os.fdopen(cst_fd, 'w') as f:
+                f.write('')
+
+        # Prepare simplified XML script with repackable residues
+        if not repackable_res:
+            # If no repackable residues specified, get all protein residues
+            repack_res_str = ','.join([str(i) for i in range(1, pose.total_residue())])
+        else:
+            repack_res_str = repackable_res
+
+        # Use the complete XML template with full DDG calculations
+        complete_xml = XML_BSITE_FASTRELAX.format(repack_res_str, cst_file_path)
+        
+        # Create temporary XML file
+        xml_fd, xml_file_path = tempfile.mkstemp(suffix='.xml', text=True)
+        with os.fdopen(xml_fd, 'w') as f:
+            f.write(complete_xml)
+
+        metrics = {}
+        try:
+            # Parse and run XML script
+            objs = XmlObjects.create_from_file(xml_file_path)
+            
+            # Apply the protocol
+            protocol = objs.get_mover('ParsedProtocol')
+            protocol.apply(pose)
+            
+            # Extract comprehensive metrics
+            try:
+                # Get contact molecular surface
+                cms_filter = objs.get_filter('cms') 
+                if cms_filter:
+                    metrics['cms'] = cms_filter.report_sm(pose)
+                
+                # Get total score
+                totalscore_filter = objs.get_filter('totalscore')
+                if totalscore_filter:
+                    metrics['totalscore'] = totalscore_filter.report_sm(pose)
+                
+                # Get residue-normalized total score
+                res_totalscore_filter = objs.get_filter('res_totalscore')
+                if res_totalscore_filter:
+                    metrics['res_totalscore'] = res_totalscore_filter.report_sm(pose)
+                
+                # Get DDG after relaxation with constraints
+                ddg_after_relax_filter = objs.get_filter('ddg_after_relax_cst')
+                if ddg_after_relax_filter:
+                    metrics['ddg_after_relax_cst'] = ddg_after_relax_filter.report_sm(pose)
+                
+                # Get DDG without constraints (more accurate binding energy)
+                ddg_filter = objs.get_filter('ddg')
+                if ddg_filter:
+                    metrics['ddg'] = ddg_filter.report_sm(pose)
+                else:
+                    # Fallback to DDG with constraints
+                    metrics['ddg'] = metrics.get('ddg_after_relax_cst', metrics.get('totalscore', 0.0))
+                    
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Could not extract some metrics: {e}")
+                # Set fallback values for missing metrics
+                from pyrosetta.rosetta.core.scoring import get_score_function
+                scorefxn = get_score_function()
+                total_energy = scorefxn(pose)
+                metrics['totalscore'] = total_energy
+                metrics['ddg'] = total_energy  # Use total score as ddg fallback
+                metrics['cms'] = 0.0
+                metrics['res_totalscore'] = total_energy / pose.total_residue()
+                metrics['ddg_after_relax_cst'] = total_energy
+                    
+        finally:
+            # Clean up temporary files
+            try:
+                os.unlink(xml_file_path)
+                os.unlink(cst_file_path)
+            except Exception:
+                pass
 
         # Save output
         pose.dump_pdb(output_path)
         if not os.path.exists(output_path):
             raise RuntimeError("Output PDB file was not created")
 
-        return {'success': True, 'input_path': pdb_path, 'output_path': output_path, 'error': None}
+        return {
+            'success': True, 
+            'input_path': pdb_path, 
+            'output_path': output_path, 
+            'error': None,
+            'metrics': metrics
+        }
+        
     except Exception as e:
-        return {'success': False, 'input_path': pdb_path, 'output_path': output_path, 'error': str(e)}
+        return {
+            'success': False, 
+            'input_path': pdb_path, 
+            'output_path': output_path, 
+            'error': str(e),
+            'metrics': {}
+        }
 
 
 def get_worker_config(num_structures, args):
-    num_processes = getattr(args, 'num_processes', min(4, cpu_count()))
-    pyrosetta_threads = getattr(args, 'pyrosetta_threads', 1)
-    num_processes = min(num_processes, num_structures)
+    # Calculate optimal configuration for better performance while preventing oversubscription
+    available_cores = cpu_count()
+    max_processes = getattr(args, 'num_processes', min(6, available_cores))
+    
+    # For small numbers of structures, use conservative settings
     if num_structures < 2:
         num_processes = 1
-        pyrosetta_threads = 1
+        pyrosetta_threads = 2  # Allow some threading for single structures
+    else:
+        # Use more aggressive settings now that constraints work properly
+        num_processes = min(max_processes, num_structures, available_cores // 3)  # Leave some cores free
+        # Allow 2-3 threads per process for better performance (but not too many)
+        pyrosetta_threads = min(3, max(1, available_cores // num_processes))
+        
+    if args.verbose:
+        print(f"Worker config: {num_processes} processes, {pyrosetta_threads} threads/process")
+        print(f"Total threads: {num_processes * pyrosetta_threads}, Available cores: {available_cores}")
+    
     return {
         'num_processes': num_processes,
         'pyrosetta_threads': pyrosetta_threads
@@ -329,7 +469,7 @@ class LigandMPNNFastRelax:
         if self.args.save_stats:
             os.makedirs(f"{self.base_folder}stats", exist_ok=True)
             
-    def generate_sequences(self, pdb_path, num_sequences=1, temperature=0.1, 
+    def generate_sequences(self, pdb_path, num_sequences=1, temperature=0.1,
                           fixed_residues=None, redesigned_residues=None):
         """
         Generate sequences using LigandMPNN with batch processing
@@ -663,42 +803,17 @@ class LigandMPNNFastRelax:
         except Exception as e:
             if self.args.verbose:
                 print(f"Warning: Backbone writing failed: {e}")
-                print("Falling back to PyRosetta threading...")
-            return self._thread_sequence_fallback(pdb_path, sequence, output_path)
     
-    def _thread_sequence_fallback(self, pdb_path, sequence, output_path):
-        """Fallback PyRosetta threading method"""
-        pose = self.pyrosetta.pose_from_pdb(pdb_path)
-        
-        # Thread sequence
-        seq_list = list(sequence)
-        threaded_count = 0
-        for i, aa in enumerate(seq_list):
-            res_num = i + 1
-            if res_num <= pose.total_residue() and pose.residue(res_num).is_protein():
-                try:
-                    self.toolbox.mutants.mutate_residue(pose, res_num, aa)
-                    threaded_count += 1
-                except Exception as e:
-                    if self.args.verbose:
-                        print(f"Warning: Could not mutate residue {res_num} to {aa}: {e}")
-                    
-        # Save threaded structure
-        pose.dump_pdb(output_path)
-        
-        if self.args.verbose:
-            print(f"Fallback threading completed: {threaded_count}/{len(seq_list)} residues")
-            
-        return output_path
-        
     def fast_relax_parallel(self, structure_paths):
-        if len(structure_paths) == 1:
-            return self._fast_relax_sequential(structure_paths)
         worker_config = get_worker_config(len(structure_paths), self.args)
         num_processes = worker_config['num_processes']
         pyrosetta_threads = worker_config['pyrosetta_threads']
         if self.args.verbose:
             print(f"Fast relax: {len(structure_paths)} structures, {num_processes} processes, {pyrosetta_threads} threads/process")
+        
+        # Get repackable residues and target atoms for constraints
+        repackable_res = getattr(self.args, 'repackable_res', '')
+        target_atm_for_cst = getattr(self.args, 'target_atm_for_cst', '')
         
         worker_inputs = []
         for pdb_path in structure_paths:
@@ -709,10 +824,13 @@ class LigandMPNNFastRelax:
                 self.args.ligand_params_path,
                 self.args.use_genpot,
                 self.args.verbose,
-                pyrosetta_threads
+                pyrosetta_threads,
+                repackable_res,
+                target_atm_for_cst
             ))
 
         successful_paths = []
+        all_metrics = []
         failed_count = 0
         try:
             ctx = mp.get_context('spawn')
@@ -722,139 +840,23 @@ class LigandMPNNFastRelax:
                     result = future.result()
                     if result['success']:
                         successful_paths.append(result['output_path'])
+                        all_metrics.append(result['metrics'])
                     else:
                         failed_count += 1
                         if self.args.verbose:
                             print(f"Failed {result['input_path']}: {result['error']}")
-                        import shutil; shutil.copy2(result['input_path'], result['output_path'])
+                        import shutil
+                        shutil.copy2(result['input_path'], result['output_path'])
                         successful_paths.append(result['output_path'])
+                        all_metrics.append({})  # Empty metrics for failed relaxation
             if self.args.verbose and failed_count > 0:
                 print(f"Fast relax completed: {len(successful_paths)}/{len(structure_paths)} successful")
         except Exception as e:
             if self.args.verbose:
-                print(f"Multiprocessing failed: {e}, falling back to sequential")
-            return self._fast_relax_sequential(structure_paths)
-        return successful_paths
-    
-    def _fast_relax_sequential(self, structure_paths):
-        """
-        Sequential fast relax processing (fallback method)
-        """
-        relaxed_paths = []
-        
-        for pdb_path in structure_paths:
-            relaxed_path = pdb_path.replace('/backbones/', '/relaxed/').replace('.pdb', '_relaxed.pdb')
-            os.makedirs(os.path.dirname(relaxed_path), exist_ok=True)
-            
-            try:
-                if self.args.verbose:
-                    print(f"Processing: {os.path.basename(pdb_path)}")
-                
-                # Load pose
-                pose = self.pyrosetta.pose_from_pdb(pdb_path)
-                if pose.total_residue() == 0:
-                    raise ValueError("Empty pose loaded")
-                
-                # Set up FastRelax
-                scorefxn = self.get_score_function()
-                fr = self.FastRelax()
-                fr.set_scorefxn(scorefxn)
-                fr.constrain_relax_to_start_coords(True)
-                fr.coord_constrain_sidechains(True)
-                fr.ramp_down_constraints(False)
-                
-                # Run FastRelax
-                fr.apply(pose)
-                
-                # Save result
-                pose.dump_pdb(relaxed_path)
-                relaxed_paths.append(relaxed_path)
-                
-            except Exception as e:
-                if self.args.verbose:
-                    print(f"Error processing {pdb_path}: {e}")
-                
-                # Fallback: copy original file
-                try:
-                    import shutil
-                    shutil.copy2(pdb_path, relaxed_path)
-                    relaxed_paths.append(relaxed_path)
-                except Exception:
-                    relaxed_paths.append(pdb_path)
-        
-        return relaxed_paths
-        
-    def fast_relax(self, pose, cycles=5):
-        """Perform fast relax on pose with proper threading"""
-        if self.args.verbose:
-            print("Performing fast relax...")
-        
-        # CRITICAL: Reinitialize PyRosetta with threading support for main process
-        # This ensures FastRelax uses proper multithreading
-        try:
-            import pyrosetta
-            from pyrosetta.rosetta.basic.thread_manager import RosettaThreadManager
-            
-            # Set environment variables for threading
-            pyrosetta_threads = getattr(self.args, 'pyrosetta_threads', 4)
-            os.environ['OMP_NUM_THREADS'] = str(pyrosetta_threads)
-            os.environ['ROSETTA_NUM_THREADS'] = str(pyrosetta_threads)
-            
-            # Check if we need to reinitialize
-            thread_manager = RosettaThreadManager.get_instance()
-            current_threads = thread_manager.total_threads()
-            
-            if current_threads < pyrosetta_threads:
-                if self.args.verbose:
-                    print(f"Reinitializing PyRosetta with {pyrosetta_threads} threads (current: {current_threads})")
-                
-                # Finalize and reinitialize
-                pyrosetta.finalize()
-                
-                # Build new init flags with threading
-                init_flags = ['-beta']
-                if not self.args.verbose:
-                    init_flags.append('-mute all')
-                
-                init_flags.extend([
-                    f'-multithreading:total_threads {pyrosetta_threads}',
-                    f'-multithreading:interaction_graph_threads {pyrosetta_threads}',
-                    '-run:multiple_processes_writing_to_one_directory'
-                ])
-                
-                # Add ligand parameters
-                if self.args.use_genpot:
-                    init_flags.extend(['-gen_potential', f'-extra_res_fa {self.args.ligand_params_path}'])
-                else:
-                    init_flags.append(f'-extra_res_fa {self.args.ligand_params_path}')
-                
-                # Reinitialize
-                pyrosetta.init(' '.join(init_flags))
-                
-                if self.args.verbose:
-                    print(f"✓ PyRosetta reinitialized with {pyrosetta_threads} threads")
-                    
-        except Exception as e:
-            if self.args.verbose:
-                print(f"Warning: Could not reinitialize PyRosetta threading: {e}")
-            
-        # Set up scoring function
-        scorefxn = self.get_score_function()
-        
-        # Set up FastRelax
-        fr = self.FastRelax()
-        fr.set_scorefxn(scorefxn)
-        
-        # Run fast relax
-        start_time = time.time()
-        fr.apply(pose)
-        end_time = time.time()
-        
-        if self.args.verbose:
-            print(f"Fast relax completed in {end_time - start_time:.2f} seconds")
-            
-        return pose
-        
+                print(f"Error during fast relax: {e}")
+            raise e
+        return successful_paths, all_metrics
+
     def run_mpnn_fastrelax_cycle(self, pdb_path, cycle_num=1):
         """
         Run one cycle of LigandMPNN design + fast relax with parallel processing
@@ -888,78 +890,39 @@ class LigandMPNNFastRelax:
         # Create structures for all sequences (if multiple sequences generated)
         header = os.path.basename(pdb_path).replace('.pdb', '')
         structure_paths = []
-        
-        if len(sequences) == 1:
-            # Single sequence - use simple approach
-            best_sequence = sequences[0].copy()  # Make a copy to avoid reference issues
-            threaded_path = f"{self.base_folder}backbones/{header}_cycle_{cycle_num}_best.pdb"
+        # Multiple sequences - create structures for all and parallel relax
+        for i, seq_data in enumerate(sequences):
+            threaded_path = f"{self.base_folder}backbones/{header}_cycle_{cycle_num}_seq_{i}.pdb"
             
             self.create_structure_with_sequence(
                 pdb_path, 
-                best_sequence['sequence'], 
-                best_sequence['S_sample'], 
+                seq_data['sequence'], 
+                seq_data['S_sample'], 
                 threaded_path
             )
-            structure_paths = [threaded_path]
-            
-        else:
-            # Multiple sequences - create structures for all and parallel relax
-            for i, seq_data in enumerate(sequences):
-                threaded_path = f"{self.base_folder}backbones/{header}_cycle_{cycle_num}_seq_{i}.pdb"
-                
-                self.create_structure_with_sequence(
-                    pdb_path, 
-                    seq_data['sequence'], 
-                    seq_data['S_sample'], 
-                    threaded_path
-                )
-                structure_paths.append(threaded_path)
+            structure_paths.append(threaded_path)
         
         # Perform fast relax (parallel if multiple structures)
-        if len(structure_paths) == 1:
-            # Single structure - use original method
-            pose = self.pyrosetta.pose_from_pdb(structure_paths[0])
-            relaxed_pose = self.fast_relax(pose)
-            relaxed_path = f"{self.base_folder}relaxed/{header}_cycle_{cycle_num}_relaxed.pdb"
-            relaxed_pose.dump_pdb(relaxed_path)
-            relaxed_paths = [relaxed_path]
+        # Multiple structures - use parallel relaxation
+        if self.args.verbose:
+            print(f"Performing parallel fast relax on {len(structure_paths)} structures")
             
-            # Calculate Rosetta energy for single structure
-            scorefxn = self.get_score_function()
-            rosetta_energy = scorefxn(relaxed_pose)
-            
-            # Update best_sequence with score information
-            best_sequence = sequences[0].copy()  # Make a copy to avoid reference issues
-            best_sequence.update({
-                'mpnn': best_sequence['score'],
-                'rosetta': rosetta_energy,
-                'final': rosetta_energy if self.args.score_method == 'rosetta_only' 
-                        else (best_sequence['score'] if self.args.score_method == 'mpnn_only'
-                        else (self.args.mpnn_weight * best_sequence['score'] + 
-                              self.args.rosetta_weight * rosetta_energy))
-            })
-            
-        else:
-            # Multiple structures - use parallel relaxation
-            if self.args.verbose:
-                print(f"Performing parallel fast relax on {len(structure_paths)} structures")
-                
-            relaxed_paths = self.fast_relax_parallel(
-                structure_paths, 
-                max_workers=getattr(self.args, 'max_relax_workers', None)
-            )
-            
-            # Evaluate relaxed structures and select best
-            best_sequence, best_relaxed_path = self._select_best_relaxed_structure(
-                sequences, relaxed_paths, cycle_num
-            )
-            
-            # Move best structure to final location
-            final_relaxed_path = f"{self.base_folder}relaxed/{header}_cycle_{cycle_num}_relaxed.pdb"
-            if best_relaxed_path != final_relaxed_path:
-                import shutil
-                shutil.copy2(best_relaxed_path, final_relaxed_path)
-            relaxed_paths = [final_relaxed_path]
+        relaxed_paths, all_metrics = self.fast_relax_parallel(
+            structure_paths, 
+            # max_workers=getattr(self.args, 'max_relax_workers', None)
+        )
+        
+        # Evaluate relaxed structures and select best
+        best_sequence, best_relaxed_path = self._select_best_relaxed_structure(
+            sequences, relaxed_paths, all_metrics, cycle_num
+        )
+        
+        # Move best structure to final location
+        final_relaxed_path = f"{self.base_folder}relaxed/{header}_cycle_{cycle_num}_relaxed.pdb"
+        if best_relaxed_path != final_relaxed_path:
+            import shutil
+            shutil.copy2(best_relaxed_path, final_relaxed_path)
+        relaxed_paths = [final_relaxed_path]
         
         # Save sequence information
         seq_path = f"{self.base_folder}seqs/{header}_cycle_{cycle_num}.fa"
@@ -979,25 +942,18 @@ class LigandMPNNFastRelax:
                 'temperature': best_sequence['temperature'],
                 'num_sequences_generated': len(sequences),
                 'sequence_diversity': len(set([seq['sequence'] for seq in sequences])),
-                # Scoring method and weights
-                'score_method': self.args.score_method,
-                'mpnn_weight': self.args.mpnn_weight,
-                'rosetta_weight': self.args.rosetta_weight,
-                'normalize_scores': self.args.normalize_scores,
+                # Simplified selection method
+                'selection_metric': self.args.selection_metric,
+                'selection_order': self.args.selection_order,
+                'selection_value': best_sequence.get('selection_value', None),
                 # Individual scores for best structure
                 'best_mpnn_score': best_sequence.get('mpnn', best_sequence['score']),
-                'best_rosetta_energy': best_sequence.get('rosetta', None),
-                'best_final_score': best_sequence.get('final', best_sequence['score']),
+                # All available metrics for best structure
+                'best_metrics': best_sequence.get('metrics', {}),
                 # All scores for analysis
                 'all_mpnn_scores': [seq['score'] for seq in sequences],
                 'all_detailed_scores': best_sequence.get('all_scores', []),
             }
-            
-            # Add normalized scores if available
-            if 'mpnn_norm' in best_sequence:
-                stats['best_mpnn_score_normalized'] = best_sequence['mpnn_norm']
-            if 'rosetta_norm' in best_sequence:
-                stats['best_rosetta_energy_normalized'] = best_sequence['rosetta_norm']
                 
             with open(stats_path, 'w') as f:
                 json.dump(stats, f, indent=2)
@@ -1005,125 +961,137 @@ class LigandMPNNFastRelax:
         if self.args.verbose:
             print(f"Cycle {cycle_num} completed")
             print(f"Best sequence: {best_sequence['sequence']}")
-            if 'mpnn' in best_sequence and 'rosetta' in best_sequence:
-                print(f"Best MPNN score: {best_sequence['mpnn']:.4f}")
-                print(f"Best Rosetta energy: {best_sequence['rosetta']:.2f}")
-                print(f"Best final score ({self.args.score_method}): {best_sequence['final']:.4f}")
-            else:
-                print(f"Best score: {best_sequence['score']:.4f}")
+            print(f"Best MPNN score: {best_sequence.get('mpnn', best_sequence['score']):.4f}")
+            print(f"Selection metric ({self.args.selection_metric}): {best_sequence.get('selection_value', 'N/A'):.4f}")
+            
+            # Show additional XML metrics if available
+            if 'metrics' in best_sequence and best_sequence['metrics']:
+                metrics = best_sequence['metrics']
+                metric_items = []
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        if key in ['ddg', 'totalscore', 'ddg_after_relax_cst']:
+                            metric_items.append(f"{key}={value:.2f}")
+                        elif key == 'cms':
+                            metric_items.append(f"{key}={value:.4f}")
+                        elif key == 'res_totalscore':
+                            metric_items.append(f"{key}={value:.3f}")
+                        else:
+                            metric_items.append(f"{key}={value:.2f}")
+                if metric_items:
+                    print(f"All metrics: {', '.join(metric_items)}")
             print(f"Final relaxed structure: {relaxed_paths[0]}")
             
         return best_sequence, relaxed_paths[0]
     
-    def _select_best_relaxed_structure(self, sequences, relaxed_paths, cycle_num):
+    def _select_best_relaxed_structure(self, sequences, relaxed_paths, all_metrics, cycle_num):
         """
-        Select best relaxed structure based on scoring method and weights
+        Select best relaxed structure based on single metric (simplified from combined scoring)
         """
         if self.args.verbose:
             print(f"Evaluating {len(sequences)} relaxed structures to select best...")
-            print(f"Using scoring method: {self.args.score_method}")
-            if self.args.score_method == 'combined':
-                print(f"MPNN weight: {self.args.mpnn_weight}, Rosetta weight: {self.args.rosetta_weight}")
+            print(f"Using selection metric: {self.args.selection_metric} ({self.args.selection_order})")
             
-        best_score = float('inf')
+        best_score = float('inf') if self.args.selection_order == 'ascending' else float('-inf')
         best_sequence = None
         best_path = None
         
         # Store individual scores for statistics
         all_scores = []
         
-        scorefxn = self.get_score_function()
-        
-        # Calculate all scores first (for normalization if needed)
+        # Extract scores from sequences and metrics
         mpnn_scores = [seq_data['score'] for seq_data in sequences]
-        rosetta_energies = []
         
-        for i, (seq_data, relaxed_path) in enumerate(zip(sequences, relaxed_paths)):
-            try:
-                pose = self.pyrosetta.pose_from_pdb(relaxed_path)
-                energy = scorefxn(pose)
-                rosetta_energies.append(energy)
-                
-            except Exception as e:
-                print(f"Error evaluating structure {i}: {e}")
-                rosetta_energies.append(float('inf'))  # Assign worst possible score
-                
-        # Normalize scores if requested
-        if self.args.normalize_scores and len(rosetta_energies) > 1:
-            mpnn_mean, mpnn_std = np.mean(mpnn_scores), np.std(mpnn_scores)
-            rosetta_mean, rosetta_std = np.mean(rosetta_energies), np.std(rosetta_energies)
+        if self.args.verbose:
+            print(f"MPNN scores range: {min(mpnn_scores):.4f} to {max(mpnn_scores):.4f}")
             
-            if mpnn_std > 0:
-                mpnn_scores_norm = [(score - mpnn_mean) / mpnn_std for score in mpnn_scores]
-            else:
-                mpnn_scores_norm = [0.0] * len(mpnn_scores)
-                
-            if rosetta_std > 0:
-                rosetta_energies_norm = [(energy - rosetta_mean) / rosetta_std for energy in rosetta_energies]
-            else:
-                rosetta_energies_norm = [0.0] * len(rosetta_energies)
-                
-            if self.args.verbose:
-                print(f"Score normalization - MPNN: μ={mpnn_mean:.3f}, σ={mpnn_std:.3f}")
-                print(f"Score normalization - Rosetta: μ={rosetta_mean:.3f}, σ={rosetta_std:.3f}")
-        else:
-            mpnn_scores_norm = mpnn_scores
-            rosetta_energies_norm = rosetta_energies
+        # Extract all available metrics for display
+        metric_values = {}
+        for metric in ['ddg', 'totalscore', 'res_totalscore', 'cms', 'ddg_after_relax_cst']:
+            values = [metrics.get(metric, float('inf')) for metrics in all_metrics]
+            metric_values[metric] = values
+            if any(v != float('inf') for v in values):
+                print(f"{metric.upper()} range: {min(v for v in values if v != float('inf')):.3f} to {max(v for v in values if v != float('inf')):.3f}")
         
-        # Select best structure based on scoring method
+        # Select best structure based on chosen metric
         for i, (seq_data, relaxed_path) in enumerate(zip(sequences, relaxed_paths)):
             mpnn_score = mpnn_scores[i]
-            rosetta_energy = rosetta_energies[i]
-            mpnn_score_norm = mpnn_scores_norm[i]
-            rosetta_energy_norm = rosetta_energies_norm[i]
+            structure_metrics = all_metrics[i]
             
-            # Calculate final score based on method
-            if self.args.score_method == 'mpnn_only':
-                final_score = mpnn_score
-                score_components = {'mpnn': mpnn_score, 'rosetta': rosetta_energy, 'final': final_score}
-            elif self.args.score_method == 'rosetta_only':
-                final_score = rosetta_energy
-                score_components = {'mpnn': mpnn_score, 'rosetta': rosetta_energy, 'final': final_score}
-            else:  # combined
-                if self.args.normalize_scores:
-                    final_score = (self.args.mpnn_weight * mpnn_score_norm + 
-                                 self.args.rosetta_weight * rosetta_energy_norm)
-                else:
-                    final_score = (self.args.mpnn_weight * mpnn_score + 
-                                 self.args.rosetta_weight * rosetta_energy)
-                score_components = {
-                    'mpnn': mpnn_score, 
-                    'rosetta': rosetta_energy, 
-                    'mpnn_norm': mpnn_score_norm,
-                    'rosetta_norm': rosetta_energy_norm,
-                    'final': final_score
-                }
+            # Get the value for the selection metric
+            if self.args.selection_metric == 'mpnn':
+                selection_value = mpnn_score
+            else:
+                selection_value = structure_metrics.get(self.args.selection_metric, float('inf'))
+            
+            # Store all scores for this structure
+            score_components = {
+                'mpnn': mpnn_score,
+                'selection_metric': self.args.selection_metric,
+                'selection_value': selection_value,
+                'metrics': structure_metrics
+            }
             
             all_scores.append(score_components)
             
-            if self.args.verbose:
-                print(f"Structure {i}: MPNN={mpnn_score:.4f}, Rosetta={rosetta_energy:.2f}, Final={final_score:.4f}")
-            
-            if final_score < best_score:
-                best_score = final_score
-                best_sequence = seq_data.copy()  # Make a copy to avoid reference issues
-                best_sequence.update(score_components)  # Add detailed scores
+            # Track best structure based on selection order
+            is_better = False
+            if self.args.selection_order == 'ascending':
+                is_better = selection_value < best_score
+            else:  # descending
+                is_better = selection_value > best_score
+                
+            if is_better:
+                best_score = selection_value
+                best_sequence = seq_data.copy()
+                best_sequence.update(score_components)
                 best_path = relaxed_path
+                
+            if self.args.verbose:
+                print(f"Structure {i}: MPNN={mpnn_score:.4f}, {self.args.selection_metric.upper()}={selection_value:.3f}")
+                if structure_metrics:
+                    # Enhanced metric display with all available values
+                    metric_items = []
+                    for k, v in structure_metrics.items():
+                        if isinstance(v, (int, float)):
+                            if k in ['totalscore', 'ddg', 'ddg_after_relax_cst']:
+                                metric_items.append(f"{k}={v:.2f}")
+                            elif k == 'cms':
+                                metric_items.append(f"{k}={v:.4f}")
+                            elif k == 'res_totalscore':
+                                metric_items.append(f"{k}={v:.3f}")
+                            else:
+                                metric_items.append(f"{k}={v:.2f}")
+                    if metric_items:
+                        print(f"  All metrics: {', '.join(metric_items)}")
         
+        # Handle case where no valid structures found
         if best_sequence is None:
-            # Fallback to LigandMPNN score only
-            best_sequence = min(sequences, key=lambda x: x['score']).copy()
-            best_path = relaxed_paths[sequences.index(min(sequences, key=lambda x: x['score']))]
-            best_sequence.update({'final': best_sequence['score']})
-            
-        if self.args.verbose:
-            print(f"Selected best structure with {self.args.score_method} score: {best_score:.4f}")
-            if 'mpnn' in best_sequence and 'rosetta' in best_sequence:
-                print(f"  MPNN: {best_sequence['mpnn']:.4f}, Rosetta: {best_sequence['rosetta']:.2f}")
-            
-        # Store all scores for statistics
+            print("ERROR: All fast relax jobs failed! No valid structures to select from.")
+            if sequences:
+                best_sequence = sequences[0].copy()
+                best_sequence.update({
+                    'selection_metric': self.args.selection_metric,
+                    'selection_value': float('inf'),
+                    'metrics': {}
+                })
+                best_path = relaxed_paths[0] if relaxed_paths else None
+            else:
+                raise ValueError("No sequences available for selection")
+        
+        # Store all scores in best sequence for statistics
         best_sequence['all_scores'] = all_scores
-            
+        
+        if self.args.verbose:
+            print("\nBest structure selected:")
+            print(f"  Selection metric ({self.args.selection_metric}): {best_score:.4f}")
+            print(f"  MPNN score: {best_sequence.get('mpnn', 'N/A'):.4f}")
+            if 'metrics' in best_sequence and best_sequence['metrics']:
+                metrics = best_sequence['metrics']
+                print(f"  DDG: {metrics.get('ddg', 'N/A'):.2f}")
+                print(f"  Total score: {metrics.get('totalscore', 'N/A'):.2f}")
+                print(f"  Contact surface: {metrics.get('cms', 'N/A'):.4f}")
+                
         return best_sequence, best_path
         
     def run_iterative_design(self):
@@ -1197,6 +1165,12 @@ def parse_arguments():
     parser.add_argument('--use_genpot', action='store_true',
                         help='Use genpot for fast relax')
     
+    # XML relaxation settings (from original ligMPNN_FR)
+    parser.add_argument('--repackable_res', type=str, default='',
+                        help='Repackable residue numbers concatenated with comma (e.g., "10,15,27")')
+    parser.add_argument('--target_atm_for_cst', type=str, default='',
+                        help='Target ligand atom names to extract distance constraints from input design (e.g., "O,N")')
+    
     # LigandMPNN settings
     parser.add_argument('--use_side_chain_context', action='store_true',
                         help='Use side chain context in LigandMPNN')
@@ -1212,13 +1186,13 @@ def parse_arguments():
                         help='Use ligand context during side chain packing')
     
     # Batch processing and parallelization
-    parser.add_argument('--max_batch_size', type=int, default=8,
-                        help='Maximum batch size for sequence generation')
-    parser.add_argument('--num_processes', type=int, default=4,
-                        help='Number of processes for fast relax (default: 4)')
-    parser.add_argument('--pyrosetta_threads', type=int, default=4,
-                        help='Number of threads per PyRosetta process (default: 4)')
-    
+    parser.add_argument('--max_batch_size', type=int, default=1,
+                        help='Maximum batch size for sequence generation (default: 1)')
+    parser.add_argument('--num_processes', type=int, default=1,
+                        help='Number of processes for fast relax (default: 1)')
+    parser.add_argument('--pyrosetta_threads', type=int, default=1,
+                        help='Number of threads per PyRosetta process (default: 1)')
+
     # Side chain packing parameters
     parser.add_argument('--number_of_packs_per_design', type=int, default=1,
                         help='Number of side chain packing samples per design')
@@ -1235,16 +1209,13 @@ def parse_arguments():
     parser.add_argument('--zero_indexed', action='store_true',
                         help='Use zero-indexed residue numbering')
     
-    # Scoring and selection parameters
-    parser.add_argument('--score_method', type=str, default='combined', 
-                        choices=['mpnn_only', 'rosetta_only', 'combined'],
-                        help='Method for selecting best structure: mpnn_only, rosetta_only, or combined')
-    parser.add_argument('--mpnn_weight', type=float, default=1.0,
-                        help='Weight for MPNN score in combined scoring (default: 1.0)')
-    parser.add_argument('--rosetta_weight', type=float, default=0.1,
-                        help='Weight for Rosetta energy in combined scoring (default: 0.1)')
-    parser.add_argument('--normalize_scores', action='store_true',
-                        help='Normalize scores before combining (recommended for fair weighting)')
+    # Filtering and selection parameters - simplified to single metric
+    parser.add_argument('--selection_metric', type=str, default='ddg', 
+                        choices=['mpnn', 'ddg', 'totalscore', 'res_totalscore', 'cms', 'ddg_after_relax_cst'],
+                        help='Metric to use for selecting best structure')
+    parser.add_argument('--selection_order', type=str, default='ascending', 
+                        choices=['ascending', 'descending'],
+                        help='Order for selection: ascending (lower is better) or descending (higher is better)')
     
     # Other settings
     parser.add_argument('--verbose', action='store_true', default=True,
@@ -1300,7 +1271,8 @@ def main():
         
     except Exception as e:
         print(f"Error during iterative design: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return 1
     return 0
 
