@@ -13,6 +13,7 @@ import json
 import random
 import argparse
 import time
+import re
 import numpy as np
 import multiprocessing as mp
 from multiprocessing import cpu_count
@@ -883,11 +884,13 @@ class LigandMPNNFastRelax:
         
         # Create structures for all sequences (if multiple sequences generated)
         header = os.path.basename(pdb_path).replace('.pdb', '')
-        structure_paths = []
+        header = re.sub(r'(_cycle_\d+_relaxed)+', '', header)
+
         # Multiple sequences - create structures for all and parallel relax
+        cycle_tag = f"{header}_cycle_{cycle_num}"
+        structure_paths = []
         for i, seq_data in enumerate(sequences):
-            threaded_path = f"{self.base_folder}backbones/{header}_cycle_{cycle_num}_seq_{i}.pdb"
-            
+            threaded_path = f"{self.base_folder}backbones/{cycle_tag}_seq_{i}.pdb"
             self.create_structure_with_sequence(
                 pdb_path, 
                 seq_data['sequence'], 
@@ -912,21 +915,26 @@ class LigandMPNNFastRelax:
         )
         
         # Move best structure to final location
-        final_relaxed_path = f"{self.base_folder}relaxed/{header}_cycle_{cycle_num}_relaxed.pdb"
+        final_relaxed_path = f"{self.base_folder}relaxed/{cycle_tag}_relaxed.pdb"
         if best_relaxed_path != final_relaxed_path:
             import shutil
             shutil.copy2(best_relaxed_path, final_relaxed_path)
         relaxed_paths = [final_relaxed_path]
         
         # Save sequence information
-        seq_path = f"{self.base_folder}seqs/{header}_cycle_{cycle_num}.fa"
-        with open(seq_path, 'w') as f:
+        seq_path_best = f"{self.base_folder}seqs/{cycle_tag}_best.fa"
+        with open(seq_path_best, 'w') as f:
             f.write(f">cycle_{cycle_num}_score_{best_sequence['score']:.4f}\n")
             f.write(f"{best_sequence['sequence']}\n")
-            
-        # Save statistics if requested
+
+        seq_path = f"{self.base_folder}seqs/{cycle_tag}.fa"
+        with open(seq_path, 'w') as f:
+            for i, seq_data in enumerate(sequences):
+                f.write(f">{cycle_tag}_seq_{i}\n")
+                f.write(f"{seq_data['sequence']}\n")
+
         if self.args.save_stats:
-            stats_path = f"{self.base_folder}stats/{header}_cycle_{cycle_num}.json"
+            stats_path = f"{self.base_folder}stats/{cycle_tag}.json"
             stats = {
                 'cycle': cycle_num,
                 'input_pdb': pdb_path,
@@ -946,7 +954,7 @@ class LigandMPNNFastRelax:
                 'best_metrics': best_sequence.get('metrics', {}),
                 # All scores for analysis
                 'all_mpnn_scores': [seq['score'] for seq in sequences],
-                'all_detailed_scores': best_sequence.get('all_scores', []),
+                'all_relax_scores': best_sequence.get('all_scores', []),
             }
                 
             with open(stats_path, 'w') as f:
