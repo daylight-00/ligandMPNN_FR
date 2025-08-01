@@ -883,7 +883,7 @@ class LigandMPNNFastRelax:
             print(f"Score range: {min(scores):.4f} to {max(scores):.4f}")
         
         # Create structures for all sequences (if multiple sequences generated)
-        header = os.path.basename(pdb_path).replace('.pdb', '')
+        header = os.path.basename(pdb_path).replace('.pdb', '').replace('.cif', '')
         header = re.sub(r'(_cycle_\d+_relaxed)+', '', header)
 
         # Multiple sequences - create structures for all and parallel relax
