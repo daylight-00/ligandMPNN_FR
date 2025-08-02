@@ -1,6 +1,4 @@
 import sys
-sys.path.append('/home/hwjang/aipd/LigandMPNN')
-sys.path.append('/home/hwjang/aipd/ligandMPNN_FR')
 from ligandmpnn_fastrelax_complete import parse_arguments, main
 from tqdm import tqdm
 import os
