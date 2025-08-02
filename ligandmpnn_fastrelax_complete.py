@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-LigandMPNN with Fast Relax Integration - Complete Version (spawn start method)
-Updated to use multiprocessing.spawn to ensure fresh PyRosetta threading
+Iterative LigandMPNN-FastRelax for Backbone Optimization
 
-Author: Updated version based on successful debugging session
-Date: 2025
+Combines LigandMPNN sequence design with PyRosetta FastRelax structural 
+optimization through iterative design-relax cycles to improve protein-ligand 
+binding interfaces.
+
+David Hyunyoo Jang (hwjang00@snu.ac.kr)
 """
 
 import os
