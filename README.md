@@ -29,9 +29,6 @@ mamba create -n ligmpnn-fr -y \
     openbabel
 
 conda activate ligmpnn-fr
-
-# Install specialized packages
-pip install git+https://github.com/jamesmkrieger/ProDy@unpin_numpy
 ```
 
 ### Core Dependencies Installation
