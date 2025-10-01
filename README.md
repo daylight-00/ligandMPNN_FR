@@ -35,17 +35,8 @@ conda activate ligmpnn-fr
 
 ```bash
 # 1. LigandMPNN
-git clone https://github.com/daylight-00/LigandMPNN.git
-cd LigandMPNN
-# Follow LigandMPNN installation instructions
-
 # 2. PyRosetta
-# Download PyRosetta from https://www.pyrosetta.org/downloads
-# Extract and install according to PyRosetta documentation
-
 # 3. This repository
-git clone https://github.com/yourusername/ligandmpnn-fastrelax.git
-cd ligandmpnn-fastrelax
 ```
 
 ## Key Improvements from Original Implementation
@@ -222,6 +213,7 @@ def extract_dist_cst_from_pdb(pdb_in, lig_tr_atms, bsite_res=''):
 
 - **Parallel Processing**: Multiple structures relaxed simultaneously using multiprocessing
 - **Multithreading**: Configurable thread allocation per PyRosetta process
+      need to fix!
 - **GPU Acceleration**: LigandMPNN inference on CUDA
 - **Vectorized Operations**: NumPy-based calculations
 
@@ -240,7 +232,7 @@ Most improvements occur within the first 10-15 cycles.
 
 **Common Issues:**
 1. **Memory errors**: Reduce `--num_processes` or `--pyrosetta_threads`
-2. **Slow performance**: Check GPU availability for LigandMPNN
+2. **Version of pyrosetta**: Multithreading issues
 3. **Missing ligand**: Verify `.params` file path and format
 4. **Poor optimization**: Try different `--temperature` values (0.05-0.3)
 
@@ -249,16 +241,6 @@ Most improvements occur within the first 10-15 cycles.
 - Set `--target_atm_for_cst` for key ligand interactions
 - Monitor with `--save_stats`
 
-## Citation
-
-```bibtex
-@software{jang2025_ligandmpnn_fastrelax,
-  author = {Jang, David Hyunyoo},
-  title = {Iterative LigandMPNN-FastRelax for Backbone Optimization},
-  year = {2025},
-  url = {https://github.com/daylight/ligandMPNN_FR}
-}
-```
 
 **Related Work:**
 - **LigandMPNN**: Dauparas et al. (2022)
