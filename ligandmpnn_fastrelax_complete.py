@@ -6,6 +6,8 @@ Combines LigandMPNN sequence design with PyRosetta FastRelax structural
 optimization through iterative design-relax cycles to improve protein-ligand 
 binding interfaces.
 
+Hardcoded directories must be fixed!
+
 David Hyunyoo Jang (hwjang00@snu.ac.kr)
 """
 
@@ -21,6 +23,8 @@ import multiprocessing as mp
 from multiprocessing import cpu_count
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
+
+import sys
 
 # Import XML templates and constraint generation
 from xml_relax_after_ligMPNN import XML_BSITE_FASTRELAX
@@ -225,7 +229,8 @@ def get_worker_config(num_structures, args):
 def setup_ligandmpnn():
     """Setup LigandMPNN model and dependencies"""
     # Add LigandMPNN to path
-    ligandmpnn_path = '/home/hwjang/aipd/LigandMPNN'
+    ###############################################################
+    ligandmpnn_path = '/apps/repos/LigandMPNN'
     if ligandmpnn_path not in sys.path:
         sys.path.insert(0, ligandmpnn_path)
     
@@ -361,7 +366,8 @@ class LigandMPNNFastRelax:
                 if not model_folder.endswith('model_params/'):
                     model_folder += 'model_params/'
             else:
-                model_folder = './model_params/'
+                model_folder = '/apps/repos/LigandMPNN/model_params/'
+                ###############################################################
             checkpoint_path = f"{model_folder}{getattr(self.args, 'model_name', 'ligandmpnn_v_32_010_25')}.pt"
         if not isinstance(checkpoint_path, str) or not checkpoint_path:
             raise ValueError("Could not determine checkpoint_path for LigandMPNN model.")
@@ -396,7 +402,7 @@ class LigandMPNNFastRelax:
         
         if not checkpoint_path_sc:
             # Use default path structure like run.py
-            model_folder = getattr(self.args, 'path_to_model_weights', '/home/hwjang/aipd/LigandMPNN/')
+            model_folder = getattr(self.args, 'path_to_model_weights', '/apps/repos/LigandMPNN/')
             if model_folder[-1] != '/':
                 model_folder += '/'
             checkpoint_path_sc = f"{model_folder}ligandmpnn_sc_v_32_002_16.pt"
@@ -1141,7 +1147,7 @@ def parse_arguments(args=None):
                         help='Output folder path')
     
     # Model settings
-    parser.add_argument('--path_to_model_weights', type=str, default='/home/hwjang/aipd/LigandMPNN/',
+    parser.add_argument('--path_to_model_weights', type=str, default='apps/repos/LigandMPNN/',
                         help='Path to model weights')
     parser.add_argument('--model_name', type=str, default='ligandmpnn_v_32_010_25',
                         help='Model name')
