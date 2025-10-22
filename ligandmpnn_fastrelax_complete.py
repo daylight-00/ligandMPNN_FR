@@ -6,9 +6,11 @@ Combines LigandMPNN sequence design with PyRosetta FastRelax structural
 optimization through iterative design-relax cycles to improve protein-ligand 
 binding interfaces.
 
-Hardcoded directories must be fixed!
-
 David Hyunyoo Jang (hwjang00@snu.ac.kr)
+
+
++ TK added h-bond calculation version
+
 """
 
 import os
@@ -24,11 +26,56 @@ from multiprocessing import cpu_count
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 
-import sys
-
 # Import XML templates and constraint generation
 from xml_relax_after_ligMPNN import XML_BSITE_FASTRELAX
 from gen_prot_lig_dist_cst import extract_dist_cst_from_pdb
+from collections import defaultdict # For h-bond calculation_TK_added
+import pyrosetta
+
+ # Calculate hydrogen bonds
+def calc_hb(pose, nres, target_hb_atms):
+    if isinstance(target_hb_atms, str):
+        target_hb_atms = target_hb_atms.split(',')
+    hbond_set = pyrosetta.rosetta.core.scoring.hbonds.HBondSet()
+    pose.update_residue_neighbors()
+    pyrosetta.rosetta.core.scoring.hbonds.fill_hbond_set(pose, False, hbond_set)
+    #
+    lig_res = pose.residue(nres)
+    lig_atm_hb = defaultdict(list)
+    for lig_atmName in target_hb_atms:
+        atm_idx = lig_res.atom_index(lig_atmName)
+        atm_id = pyrosetta.rosetta.core.id.AtomID(atm_idx, nres)
+        found_hbs = hbond_set.atom_hbonds(atm_id)
+        #
+        if (len(found_hbs) == 0):
+            continue
+        for hb in found_hbs:
+            don_resNo = hb.don_res()
+            don_atmName = pose.residue(don_resNo).atom_name(hb.don_hatm())
+            acc_resNo = hb.acc_res()
+            acc_atmName = pose.residue(acc_resNo).atom_name(hb.acc_atm())
+            #
+            hb_atm = {don_resNo: don_atmName, acc_resNo: acc_atmName}
+            #
+            hb_res_pair = [don_resNo, acc_resNo]
+            for i_res, resno in enumerate(hb_res_pair):
+                if resno == nres:
+                    other_resno = hb_res_pair[1 - i_res]
+                    if other_resno == resno:
+                        continue
+                    lig_atm_hb[hb_atm[resno].strip()].append((other_resno, hb_atm[other_resno]))
+            hb_sc = {}
+    for lig_atmName in target_hb_atms:
+        if lig_atmName not in list(lig_atm_hb.keys()):
+            hb_sc['%s_hbond'%lig_atmName] = 0
+        else:
+            tmp = []
+            for hb in lig_atm_hb[lig_atmName]:
+                if hb not in tmp:
+                    tmp.append(hb)
+            hb_sc['%s_hbond'%lig_atmName] = len(tmp)
+    return hb_sc        
+
 
 # Global function for multiprocessing - must be at module level
 def fast_relax_worker(input_data):
@@ -46,6 +93,7 @@ def fast_relax_worker(input_data):
         from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
         import tempfile
         import os
+
 
         # Improved init flags - use flexible threading
         init_flags = ['-beta', '-mute all']  # Always mute to reduce log spam
@@ -78,6 +126,7 @@ def fast_relax_worker(input_data):
         if target_atm_for_cst:
             try:
                 target_atoms = target_atm_for_cst.split(',') if isinstance(target_atm_for_cst, str) else target_atm_for_cst
+                print(f"DEBUG: target_atm_for_cst = {repr(target_atm_for_cst)}, target_atoms = {target_atoms}")  # DEBUG added
                 if target_atoms and target_atoms != ['']:
                     # Generate constraints
                     if verbose:
@@ -133,7 +182,8 @@ def fast_relax_worker(input_data):
             # Apply the protocol
             protocol = objs.get_mover('ParsedProtocol')
             protocol.apply(pose)
-            
+            #apply 이후, pose는 relaxed 상태.
+
             # Extract comprehensive metrics
             try:
                 # Get contact molecular surface
@@ -163,7 +213,13 @@ def fast_relax_worker(input_data):
                 else:
                     # Fallback to DDG with constraints
                     metrics['ddg'] = metrics.get('ddg_after_relax_cst', metrics.get('totalscore', 0.0))
-                    
+
+                # Get hydrogen bond metrics
+                hb_d = calc_hb(pose, len(pose), target_atm_for_cst)
+                total_hb = sum(hb_d.values())
+                hb_d['total_hb'] = total_hb
+                metrics.update(hb_d)
+
             except Exception as e:
                 if verbose:
                     print(f"Warning: Could not extract some metrics: {e}")
@@ -176,6 +232,8 @@ def fast_relax_worker(input_data):
                 metrics['cms'] = 0.0
                 metrics['res_totalscore'] = total_energy / pose.total_residue()
                 metrics['ddg_after_relax_cst'] = total_energy
+                hb_d = {}
+                metrics.update(hb_d)
                     
         finally:
             # Clean up temporary files
@@ -229,7 +287,6 @@ def get_worker_config(num_structures, args):
 def setup_ligandmpnn():
     """Setup LigandMPNN model and dependencies"""
     # Add LigandMPNN to path
-    ###############################################################
     ligandmpnn_path = '/apps/repos/LigandMPNN'
     if ligandmpnn_path not in sys.path:
         sys.path.insert(0, ligandmpnn_path)
@@ -366,8 +423,7 @@ class LigandMPNNFastRelax:
                 if not model_folder.endswith('model_params/'):
                     model_folder += 'model_params/'
             else:
-                model_folder = '/apps/repos/LigandMPNN/model_params/'
-                ###############################################################
+                model_folder = './model_params/'
             checkpoint_path = f"{model_folder}{getattr(self.args, 'model_name', 'ligandmpnn_v_32_010_25')}.pt"
         if not isinstance(checkpoint_path, str) or not checkpoint_path:
             raise ValueError("Could not determine checkpoint_path for LigandMPNN model.")
@@ -1147,7 +1203,7 @@ def parse_arguments(args=None):
                         help='Output folder path')
     
     # Model settings
-    parser.add_argument('--path_to_model_weights', type=str, default='apps/repos/LigandMPNN/',
+    parser.add_argument('--path_to_model_weights', type=str, default='/apps/repos/LigandMPNN/model_params/',
                         help='Path to model weights')
     parser.add_argument('--model_name', type=str, default='ligandmpnn_v_32_010_25',
                         help='Model name')
