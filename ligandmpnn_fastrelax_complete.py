@@ -10,6 +10,7 @@ David Hyunyoo Jang (hwjang00@snu.ac.kr)
 
 
 + TK added h-bond calculation version
+atms for h-bond calculation should be provided via --target_atm_for_cst argument (comma-separated)
 
 """
 
