@@ -26,7 +26,8 @@ mamba create -n ligmpnn-fr -y \
     python=3.12 \
     pytorch pytorch-cuda=12.4 \
     numpy scipy pandas \
-    openbabel
+    openbabel \
+    biopython prody ml-collections dm-tree
 
 conda activate ligmpnn-fr
 ```
