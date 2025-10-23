@@ -10,7 +10,7 @@ David Hyunyoo Jang (hwjang00@snu.ac.kr)
 
 
 + TK added h-bond calculation version
-atms for h-bond calculation should be provided via --target_atm_for_cst argument (comma-separated)
+atms for h-bond calculation should be provided via --hb_atoms (comma-separated)
 
 """
 
@@ -88,7 +88,7 @@ def fast_relax_worker(input_data):
     import os
     import tempfile
     
-    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads, repackable_res, target_atm_for_cst = input_data
+    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads, repackable_res, target_atm_for_cst, hb_atoms = input_data
     try:
         import pyrosetta
         from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
@@ -127,7 +127,6 @@ def fast_relax_worker(input_data):
         if target_atm_for_cst:
             try:
                 target_atoms = target_atm_for_cst.split(',') if isinstance(target_atm_for_cst, str) else target_atm_for_cst
-                print(f"DEBUG: target_atm_for_cst = {repr(target_atm_for_cst)}, target_atoms = {target_atoms}")  # DEBUG added
                 if target_atoms and target_atoms != ['']:
                     # Generate constraints
                     if verbose:
@@ -215,12 +214,6 @@ def fast_relax_worker(input_data):
                     # Fallback to DDG with constraints
                     metrics['ddg'] = metrics.get('ddg_after_relax_cst', metrics.get('totalscore', 0.0))
 
-                # Get hydrogen bond metrics
-                hb_d = calc_hb(pose, len(pose), target_atm_for_cst)
-                total_hb = sum(hb_d.values())
-                hb_d['total_hb'] = total_hb
-                metrics.update(hb_d)
-
             except Exception as e:
                 if verbose:
                     print(f"Warning: Could not extract some metrics: {e}")
@@ -233,8 +226,16 @@ def fast_relax_worker(input_data):
                 metrics['cms'] = 0.0
                 metrics['res_totalscore'] = total_energy / pose.total_residue()
                 metrics['ddg_after_relax_cst'] = total_energy
-                hb_d = {}
-                metrics.update(hb_d)
+           
+            # Get hydrogen bond metrics
+            try:
+                hb_d = calc_hb(pose, len(pose), hb_atoms)
+                total_hb = sum(hb_d.values())
+                hb_d['total_hb'] = total_hb
+
+            except Exception as e:
+                hb_d = {'total_hb': 0}
+            metrics.update(hb_d)
                     
         finally:
             # Clean up temporary files
@@ -874,6 +875,7 @@ class LigandMPNNFastRelax:
         # Get repackable residues and target atoms for constraints
         repackable_res = getattr(self.args, 'repackable_res', '')
         target_atm_for_cst = getattr(self.args, 'target_atm_for_cst', '')
+        hb_atoms = getattr(self.args, 'hb_atoms', '')
         
         worker_inputs = []
         for pdb_path in structure_paths:
@@ -886,7 +888,8 @@ class LigandMPNNFastRelax:
                 self.args.verbose,
                 pyrosetta_threads,
                 repackable_res,
-                target_atm_for_cst
+                target_atm_for_cst,
+                hb_atoms
             ))
 
         successful_paths = []
@@ -1292,6 +1295,8 @@ def parse_arguments(args=None):
                         help='Save detailed statistics')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--hb_atoms', type=str, default='',
+                       help='Target ligand atom names for hydrogen bond calculation (comma-separated, e.g., "O1,O2,O3")')
     
     return parser.parse_args(args)
 
