@@ -138,6 +138,7 @@ python ligandmpnn_fastrelax_complete.py \
     --pack_side_chains \
     --temperature 0.15 \
     --target_atm_for_cst "O1,N1,N2" \
+    --hb_atoms "O1,O2,O3" \
     --save_stats
 ```
 
