@@ -7,6 +7,11 @@ optimization through iterative design-relax cycles to improve protein-ligand
 binding interfaces.
 
 David Hyunyoo Jang (hwjang00@snu.ac.kr)
+
+
++ TK added h-bond calculation version
+atms for h-bond calculation should be provided via --hb_atoms (comma-separated)
+
 """
 
 import os
@@ -25,6 +30,53 @@ import torch
 # Import XML templates and constraint generation
 from xml_relax_after_ligMPNN import XML_BSITE_FASTRELAX
 from gen_prot_lig_dist_cst import extract_dist_cst_from_pdb
+from collections import defaultdict # For h-bond calculation_TK_added
+import pyrosetta
+
+ # Calculate hydrogen bonds
+def calc_hb(pose, nres, target_hb_atms):
+    if isinstance(target_hb_atms, str):
+        target_hb_atms = target_hb_atms.split(',')
+    hbond_set = pyrosetta.rosetta.core.scoring.hbonds.HBondSet()
+    pose.update_residue_neighbors()
+    pyrosetta.rosetta.core.scoring.hbonds.fill_hbond_set(pose, False, hbond_set)
+    #
+    lig_res = pose.residue(nres)
+    lig_atm_hb = defaultdict(list)
+    for lig_atmName in target_hb_atms:
+        atm_idx = lig_res.atom_index(lig_atmName)
+        atm_id = pyrosetta.rosetta.core.id.AtomID(atm_idx, nres)
+        found_hbs = hbond_set.atom_hbonds(atm_id)
+        #
+        if (len(found_hbs) == 0):
+            continue
+        for hb in found_hbs:
+            don_resNo = hb.don_res()
+            don_atmName = pose.residue(don_resNo).atom_name(hb.don_hatm())
+            acc_resNo = hb.acc_res()
+            acc_atmName = pose.residue(acc_resNo).atom_name(hb.acc_atm())
+            #
+            hb_atm = {don_resNo: don_atmName, acc_resNo: acc_atmName}
+            #
+            hb_res_pair = [don_resNo, acc_resNo]
+            for i_res, resno in enumerate(hb_res_pair):
+                if resno == nres:
+                    other_resno = hb_res_pair[1 - i_res]
+                    if other_resno == resno:
+                        continue
+                    lig_atm_hb[hb_atm[resno].strip()].append((other_resno, hb_atm[other_resno]))
+            hb_sc = {}
+    for lig_atmName in target_hb_atms:
+        if lig_atmName not in list(lig_atm_hb.keys()):
+            hb_sc['%s_hbond'%lig_atmName] = 0
+        else:
+            tmp = []
+            for hb in lig_atm_hb[lig_atmName]:
+                if hb not in tmp:
+                    tmp.append(hb)
+            hb_sc['%s_hbond'%lig_atmName] = len(tmp)
+    return hb_sc        
+
 
 # Global function for multiprocessing - must be at module level
 def fast_relax_worker(input_data):
@@ -36,12 +88,13 @@ def fast_relax_worker(input_data):
     import os
     import tempfile
     
-    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads, repackable_res, target_atm_for_cst = input_data
+    pdb_path, output_path, ligand_params_path, use_genpot, verbose, pyrosetta_threads, repackable_res, target_atm_for_cst, hb_atoms = input_data
     try:
         import pyrosetta
         from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
         import tempfile
         import os
+
 
         # Improved init flags - use flexible threading
         init_flags = ['-beta', '-mute all']  # Always mute to reduce log spam
@@ -129,7 +182,8 @@ def fast_relax_worker(input_data):
             # Apply the protocol
             protocol = objs.get_mover('ParsedProtocol')
             protocol.apply(pose)
-            
+            #apply 이후, pose는 relaxed 상태.
+
             # Extract comprehensive metrics
             try:
                 # Get contact molecular surface
@@ -159,7 +213,7 @@ def fast_relax_worker(input_data):
                 else:
                     # Fallback to DDG with constraints
                     metrics['ddg'] = metrics.get('ddg_after_relax_cst', metrics.get('totalscore', 0.0))
-                    
+
             except Exception as e:
                 if verbose:
                     print(f"Warning: Could not extract some metrics: {e}")
@@ -172,6 +226,16 @@ def fast_relax_worker(input_data):
                 metrics['cms'] = 0.0
                 metrics['res_totalscore'] = total_energy / pose.total_residue()
                 metrics['ddg_after_relax_cst'] = total_energy
+           
+            # Get hydrogen bond metrics
+            try:
+                hb_d = calc_hb(pose, len(pose), hb_atoms)
+                total_hb = sum(hb_d.values())
+                hb_d['total_hb'] = total_hb
+
+            except Exception as e:
+                hb_d = {'total_hb': 0}
+            metrics.update(hb_d)
                     
         finally:
             # Clean up temporary files
@@ -225,7 +289,7 @@ def get_worker_config(num_structures, args):
 def setup_ligandmpnn():
     """Setup LigandMPNN model and dependencies"""
     # Add LigandMPNN to path
-    ligandmpnn_path = '/home/hwjang/aipd/LigandMPNN'
+    ligandmpnn_path = '/apps/repos/LigandMPNN'
     if ligandmpnn_path not in sys.path:
         sys.path.insert(0, ligandmpnn_path)
     
@@ -396,7 +460,7 @@ class LigandMPNNFastRelax:
         
         if not checkpoint_path_sc:
             # Use default path structure like run.py
-            model_folder = getattr(self.args, 'path_to_model_weights', '/home/hwjang/aipd/LigandMPNN/')
+            model_folder = getattr(self.args, 'path_to_model_weights', '/apps/repos/LigandMPNN/')
             if model_folder[-1] != '/':
                 model_folder += '/'
             checkpoint_path_sc = f"{model_folder}ligandmpnn_sc_v_32_002_16.pt"
@@ -811,6 +875,7 @@ class LigandMPNNFastRelax:
         # Get repackable residues and target atoms for constraints
         repackable_res = getattr(self.args, 'repackable_res', '')
         target_atm_for_cst = getattr(self.args, 'target_atm_for_cst', '')
+        hb_atoms = getattr(self.args, 'hb_atoms', '')
         
         worker_inputs = []
         for pdb_path in structure_paths:
@@ -823,7 +888,8 @@ class LigandMPNNFastRelax:
                 self.args.verbose,
                 pyrosetta_threads,
                 repackable_res,
-                target_atm_for_cst
+                target_atm_for_cst,
+                hb_atoms
             ))
 
         successful_paths = []
@@ -1141,7 +1207,7 @@ def parse_arguments(args=None):
                         help='Output folder path')
     
     # Model settings
-    parser.add_argument('--path_to_model_weights', type=str, default='/home/hwjang/aipd/LigandMPNN/',
+    parser.add_argument('--path_to_model_weights', type=str, default='/apps/repos/LigandMPNN/model_params/',
                         help='Path to model weights')
     parser.add_argument('--model_name', type=str, default='ligandmpnn_v_32_010_25',
                         help='Model name')
@@ -1229,6 +1295,8 @@ def parse_arguments(args=None):
                         help='Save detailed statistics')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--hb_atoms', type=str, default='',
+                       help='Target ligand atom names for hydrogen bond calculation (comma-separated, e.g., "O1,O2,O3")')
     
     return parser.parse_args(args)
 
