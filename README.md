@@ -1,15 +1,11 @@
 # Iterative LigandMPNN-FastRelax for Backbone Optimization
 
-**Author:** David Hyunyoo Jang  
-**Affiliation:** [Artificial Intelligence Protein Design Lab](https://sites.google.com/view/aipdlab)  
-**Date:** July 2025
-
-## Overview
-
-An iterative protein design pipeline that combines LigandMPNN sequence generation with PyRosetta FastRelax optimization. Through repeated cycles of sequence design and structural relaxation, this method can improve protein backbone geometry and binding affinity.
+**Developed at [Artificial Intelligence Protein Design Lab](https://sites.google.com/view/aipdlab)**
 
 ![Optimization Results](example/fastrelax_scores.svg)
 *Figure: Optimization results across 32 cycles for protein-ligand complexes, showing improvements in MPNN scores and binding energies (DDG).*
+
+An iterative protein design pipeline that combines LigandMPNN sequence generation with PyRosetta FastRelax optimization. Through repeated cycles of sequence design and structural relaxation, this method can improve protein backbone geometry and binding affinity.
 
 ### Key Features
 
@@ -21,7 +17,7 @@ This implementation extends the original LigandMPNN-FR concept (Gyu Rie Lee, 202
 
 ```bash
 # Create conda environment with required dependencies
-mamba create -n ligmpnn-fr -y \
+conda create -n ligmpnn-fr -y \
     -c nvidia -c pytorch -c conda-forge \
     python=3.12 \
     pytorch pytorch-cuda=12.4 \
@@ -243,10 +239,10 @@ Most improvements occur within the first 10-15 cycles.
 - Set `--target_atm_for_cst` for key ligand interactions
 - Monitor with `--save_stats`
 
+## References
+
+This implementation is based on the LigandMPNN-FR concept by Gyu Rie Lee (2022). The original script is available in the `original_script/` directory for reference. For detailed changes from the original implementation, see [`original_script/CHANGES.md`](original_script/CHANGES.md).
 
 **Related Work:**
 - **LigandMPNN**: Dauparas et al. (2022)
 - **PyRosetta**: Chaudhury et al. (2010)
-
-**Acknowledgments:**
-- Gyu Rie Lee - Original concept and supervision
