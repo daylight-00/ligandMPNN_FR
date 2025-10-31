@@ -7,10 +7,6 @@
 
 An iterative protein design pipeline that combines LigandMPNN sequence generation with PyRosetta FastRelax optimization. Through repeated cycles of sequence design and structural relaxation, this method can improve protein backbone geometry and binding affinity.
 
-### Key Features
-
-This implementation extends the original LigandMPNN-FR concept (Gyu Rie Lee, 2022) by incorporating **structural relaxation within each cycle**, rather than only at the end. This enables gradual backbone optimization through iterative design-relax cycles.
-
 ## Installation
 
 ### Environment Setup
@@ -35,23 +31,6 @@ conda activate ligmpnn-fr
 # 2. PyRosetta
 # 3. This repository
 ```
-
-## Key Improvements from Original Implementation
-
-### 1. **Per-Cycle Relaxation**
-- **Original**: Single final relaxation step
-- **This version**: Structural relaxation within each cycle, enabling gradual backbone optimization
-
-### 2. **Updated LigandMPNN API**
-- Updated from development-stage to current stable API
-- Uses `data_utils` and `model_utils` with proper `feature_dict`
-- Compatible with LigandMPNN v_32_010_25
-
-### 3. **Code Improvements**
-- **Distance constraints**: BioPython + NumPy instead of manual parsing (89 → 51 lines)
-- **Vectorized calculations** for better performance
-- **Parallel processing**: Multiprocessing support for FastRelax optimization
-- **Better error handling**
 
 ## Algorithm
 
@@ -78,15 +57,6 @@ Input: Protein-ligand complex PDB + ligand parameters
 │   └── 5. Select Best Structure → Next Cycle
 └──────────────────────────────────────┘
 ```
-
-### Differences from Original Implementation
-
-| Aspect | Original | This Implementation |
-|--------|----------|-------------------|
-| **Relaxation** | Final step only | Per-cycle relaxation |
-| **Backbone** | Static | Gradual optimization |
-| **API** | Development version | Current stable API |
-| **Parsing** | Manual | BioPython-based |
 
 ## Usage
 
@@ -241,7 +211,7 @@ Most improvements occur within the first 10-15 cycles.
 
 ## References
 
-This implementation is based on the LigandMPNN-FR concept by Gyu Rie Lee (2022). The original script is available in the `original_script/` directory for reference. For detailed changes from the original implementation, see [`original_script/CHANGES.md`](original_script/CHANGES.md).
+This implementation is based on the LigandMPNN-FR concept by Gyu Rie Lee (2022). The original script is available in the `original_script/` directory for reference. For detailed comparison with the original implementation, see [`original_script/README.md`](original_script/README.md).
 
 **Related Work:**
 - **LigandMPNN**: Dauparas et al. (2022)
