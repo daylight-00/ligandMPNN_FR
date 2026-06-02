@@ -1,18 +1,120 @@
-# Iterative LigandMPNN-FastRelax for Backbone Optimization
+# Metric-Guided LigandMPNN Recycling for Backbone-Conditioned Sequence Space Optimization
 
-**Developed at [Artificial Intelligence Protein Design Lab](https://sites.google.com/view/aipdlab)**
+This repository implements a **directional LigandMPNN–FastRelax recycling pipeline** for protein–ligand design. Instead of only drawing more LigandMPNN samples from a fixed input backbone, the pipeline uses post-relaxation metrics to select the best relaxed protein–ligand state and recycles that state into the next LigandMPNN sampling round.
 
-![Optimization Results](example/fastrelax_scores.svg)
-*Figure: Optimization results across 32 cycles for protein-ligand complexes, showing improvements in MPNN scores and binding energies (DDG).*
+In short:
 
-An iterative protein design pipeline that combines LigandMPNN sequence generation with PyRosetta FastRelax optimization. Through repeated cycles of sequence design and structural relaxation, this method can improve protein backbone geometry and binding affinity.
+```text
+sample sequence candidates
+→ relax each candidate
+→ evaluate post-relaxation metrics
+→ recycle the best relaxed state
+→ sample again from the updated backbone-ligand state
+```
+
+## Project Context
+
+This project was developed during a research internship in the Artificial Intelligence Protein Design Lab under the supervision of Prof. Gyu Rie Lee. It builds on Prof. Lee’s earlier LigandMPNN–Rosetta recycling workflow and reframes the loop as a metric-guided search over backbone-conditioned sequence sampling spaces.
+
+## Key idea
+
+LigandMPNN does not sample sequences from a global sequence space. Its sequence proposals are conditioned on the input protein backbone, ligand geometry, and optional side-chain/atom context.
+
+Therefore, increasing the number of samples from a single fixed backbone mainly explores the local sequence distribution around that backbone. This project reframes candidate generation as an optimization problem over **backbone-conditioned sequence sampling spaces**:
+
+> Find a backbone-ligand input state from which LigandMPNN samples better-scoring and more designable sequence candidates.
+
+The search is implemented as **stochastic proposal + directional selection**:
+
+1. LigandMPNN stochastically proposes a pool of sequences from the current input structure.
+2. Each candidate is structurally instantiated and relaxed with PyRosetta FastRelax.
+3. A configurable post-relaxation metric selects the best candidate.
+4. The selected relaxed structure becomes the next LigandMPNN input state.
+
+The default steering metric is Rosetta `ddg`, but the code supports alternative selection metrics.
+
+## Workflow
+
+```text
+Input protein-ligand state B_t
+        │
+        ▼
+LigandMPNN samples N sequences from P(seq | B_t)
+        │
+        ▼
+Generate candidate structures
+        │
+        ├─ optional LigandMPNN side-chain packing
+        │
+        ▼
+PyRosetta FastRelax for each candidate
+        │
+        ├─ optional ligand-distance constraints
+        ├─ Rosetta metrics: ddg, totalscore, res_totalscore, cms
+        │
+        ▼
+Select best relaxed candidate by selection metric
+        │
+        ▼
+Recycle selected relaxed state as B_{t+1}
+        │
+        └── repeat for n_cycles
+```
+
+The selected state is both the current best design and the input distribution-defining structure for the next cycle.
+
+## What is optimized?
+
+This pipeline does **not** directly optimize a single sequence in isolation. It optimizes the **input protein-ligand state** that defines the next LigandMPNN sampling distribution.
+
+A useful interpretation is:
+
+```text
+Objective:
+  improve the best candidate reachable from the next LigandMPNN sampling pool
+
+State:
+  relaxed protein-ligand structure recycled into the next cycle
+
+Update rule:
+  choose the post-relaxation candidate with the best selection metric
+```
+
+This is a greedy, metric-guided directional search over local backbone-ligand states. It should not be interpreted as global backbone optimization.
+
+## Relationship to the original GRL LigandMPNN-FR script
+
+This project builds on the 2022 LigandMPNN-FR concept by Gyu Rie Lee. The original script already contained an important recycling idea: LigandMPNN-designed sequences were threaded and refined with Rosetta, and the resulting PDBs were reused as inputs for later LigandMPNN cycles.
+
+The current implementation changes the role of recycling:
+
+```text
+Original GRL view:
+  LigandMPNN output → Rosetta cleanup/refinement → recycle structures
+
+Current view:
+  candidate pool → FastRelax every candidate → metric-guided best-state selection → recycle selected state
+```
+
+The central methodological change is that Rosetta metrics are no longer only recorded after refinement. They become the steering signal that determines which backbone-ligand state defines the next LigandMPNN sampling space.
+
+See [`original_script/`](original_script/) for the preserved baseline script and a more detailed comparison.
+
+## Features
+
+- LigandMPNN sequence sampling from protein-ligand complexes
+- Optional LigandMPNN side-chain packing before Rosetta refinement
+- PyRosetta FastRelax for every candidate in every cycle
+- Configurable metric-guided candidate selection
+- Parallel FastRelax execution with multiprocessing
+- Optional ligand-distance constraints from selected ligand atoms
+- Per-cycle FASTA, relaxed PDB, and JSON statistics outputs
 
 ## Installation
 
-### Environment Setup
+### 1. Create an environment
 
 ```bash
-# Create conda environment with required dependencies
 conda create -n ligmpnn-fr -y \
     -c nvidia -c pytorch -c conda-forge \
     python=3.12 \
@@ -23,85 +125,56 @@ conda create -n ligmpnn-fr -y \
 conda activate ligmpnn-fr
 ```
 
-### Core Dependencies Installation
+### 2. Install LigandMPNN
 
 ```bash
-# 1. LigandMPNN
 git clone https://github.com/daylight-00/LigandMPNN.git
 cd LigandMPNN
-# Follow LigandMPNN installation instructions
-
-# 2. PyRosetta
-# Download PyRosetta from https://www.pyrosetta.org/downloads
-# Extract and install according to PyRosetta documentation
-
-# 3. This repository
-git clone https://github.com/yourusername/ligandmpnn-fastrelax.git
-cd ligandmpnn-fastrelax
+# Follow LigandMPNN installation and model-weight setup instructions.
 ```
 
-## Algorithm
+### 3. Install PyRosetta
 
-```
-Input: Protein-ligand complex PDB + ligand parameters
-    ↓
-┌─→ [Iteration Cycle] ←─┐
-│   │                   │
-│   ├── 1. LigandMPNN Sequence Design
-│   │   └── Generate new amino acid sequence
-│   │
-│   ├── 2. Side Chain Packing (Optional)
-│   │   └── Optimize side chain conformations
-│   │
-│   ├── 3. PyRosetta FastRelax
-│   │   ├── Full backbone + side chain optimization
-│   │   ├── Apply distance constraints (optional)
-│   │   └── Energy minimization
-│   │
-│   ├── 4. Structure Evaluation
-│   │   ├── Calculate Rosetta energy
-│   │   └── Evaluate MPNN score
-│   │
-│   └── 5. Select Best Structure → Next Cycle
-└──────────────────────────────────────┘
+Download PyRosetta from the official PyRosetta distribution page and install it according to your license and platform.
+
+### 4. Clone this repository
+
+```bash
+git clone https://github.com/daylight-00/ligandMPNN_FR.git
+cd ligandMPNN_FR
 ```
 
 ## Usage
 
-### Quick Start
+### Minimal run
 
 ```bash
 python ligandmpnn_fastrelax_complete.py \
     --pdb_path protein_ligand_complex.pdb \
     --ligand_params_path ligand.params \
-    --out_folder output_directory \
+    --out_folder results \
     --n_cycles 5
 ```
 
-### Example Data
-
-See `example/` directory for sample input files and analysis scripts:
-- `example/lmpnn_fr.py` - Example optimization workflow
-- `example/fastrelax_scores.svg` - Visualization of optimization results
-
-### Basic Example
+### Metric-guided recycling run
 
 ```bash
-# Standard optimization with 8 cycles
 python ligandmpnn_fastrelax_complete.py \
     --pdb_path complex.pdb \
     --ligand_params_path ligand.params \
     --out_folder results \
     --n_cycles 8 \
+    --num_seq_per_target 8 \
     --temperature 0.1 \
-    --num_seq_per_target 4 \
+    --selection_metric ddg \
+    --selection_order ascending \
+    --target_atm_for_cst "O1,N1,N2" \
     --save_stats
 ```
 
-### Advanced Usage
+### Parallel FastRelax with LigandMPNN side-chain packing
 
 ```bash
-# High-throughput optimization with parallel processing
 python ligandmpnn_fastrelax_complete.py \
     --pdb_path complex.pdb \
     --ligand_params_path ligand.params \
@@ -109,127 +182,124 @@ python ligandmpnn_fastrelax_complete.py \
     --n_cycles 16 \
     --num_seq_per_target 8 \
     --num_processes 8 \
-    --pyrosetta_threads 4 \
+    --pyrosetta_threads 2 \
     --pack_side_chains \
-    --temperature 0.15 \
+    --pack_with_ligand_context 1 \
+    --selection_metric ddg \
+    --selection_order ascending \
     --target_atm_for_cst "O1,N1,N2" \
     --save_stats
 ```
 
-## Command Line Options
+## Important arguments
 
-### Required Arguments
+### Required inputs
+
 | Argument | Description |
-|----------|-------------|
-| `--pdb_path` | Input protein-ligand complex PDB file |
-| `--ligand_params_path` | Rosetta ligand parameters file (.params) |
-| `--out_folder` | Output directory for results |
+|---|---|
+| `--pdb_path` | Input protein-ligand complex PDB |
+| `--ligand_params_path` | Rosetta ligand `.params` file |
+| `--out_folder` | Output directory |
 
-### Core Parameters
+### Sampling and recycling
+
 | Argument | Default | Description |
-|----------|---------|-------------|
-| `--n_cycles` | 3 | Number of design-optimization cycles |
-| `--temperature` | 0.1 | LigandMPNN sampling temperature (0.05-0.3) |
-| `--num_seq_per_target` | 1 | Sequences generated per cycle |
+|---|---:|---|
+| `--n_cycles` | `3` | Number of LigandMPNN–FastRelax recycling cycles |
+| `--num_seq_per_target` | `1` | Number of LigandMPNN sequence candidates generated per cycle |
+| `--temperature` | `0.1` | LigandMPNN sampling temperature |
+| `--selection_metric` | `ddg` | Metric used to select the recycled state |
+| `--selection_order` | `ascending` | Whether lower or higher metric values are better |
 
-### Optimization Controls
+### Supported selection metrics
+
+| Metric | Interpretation | Typical order |
+|---|---|---|
+| `mpnn` | LigandMPNN sequence score | ascending |
+| `ddg` | Rosetta binding metric after unconstrained FastRelax | ascending |
+| `ddg_after_relax_cst` | Rosetta binding metric after constrained relaxation | ascending |
+| `totalscore` | Rosetta total score | ascending |
+| `res_totalscore` | Residue-normalized total score | ascending |
+| `cms` | Contact molecular surface | descending |
+
+`ddg` is the default because it worked as an effective steering signal in the tested workflow. It should be interpreted as a computational selection metric, not as an experimental binding affinity.
+
+### Structure and constraint controls
+
 | Argument | Default | Description |
-|----------|---------|-------------|
-| `--pack_side_chains` | False | Enable side chain packing optimization |
-| `--target_atm_for_cst` | "" | Ligand atoms for distance constraints (e.g., "O1,N1,N2") |
-| `--selection_metric` | "ddg" | Metric for structure selection (ddg/totalscore/cms) |
+|---|---:|---|
+| `--pack_side_chains` | `False` | Use LigandMPNN side-chain packer before FastRelax |
+| `--pack_with_ligand_context` | `1` | Include ligand context during side-chain packing |
+| `--repack_everything` | `False` | Repack all residues during LigandMPNN side-chain packing |
+| `--target_atm_for_cst` | `""` | Comma-separated ligand atoms used to generate distance constraints |
+| `--repackable_res` | `""` | Comma-separated residue numbers allowed for Rosetta repacking |
 
-### Performance Settings
+### Performance
+
 | Argument | Default | Description |
-|----------|---------|-------------|
-| `--num_processes` | 1 | Parallel processes for relaxation |
-| `--pyrosetta_threads` | 1 | Threads per PyRosetta process |
+|---|---:|---|
+| `--max_batch_size` | `1` | Maximum LigandMPNN sampling batch size |
+| `--num_processes` | `1` | Number of parallel FastRelax worker processes |
+| `--pyrosetta_threads` | `1` | Rosetta threads per worker process |
 
-### Advanced Options
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--redesigned_residues` | [] | Specific residues to redesign (e.g., "A45 A46 A48") |
-| `--fixed_residues` | [] | Residues to keep unchanged |
-| `--omit_AAs` | "X" | Amino acids to exclude from design |
-| `--save_stats` | False | Save detailed statistics |
+## Output structure
 
-## Output Structure
-
+```text
+results/
+├── seqs/
+│   ├── <input>_cycle_1.fa
+│   ├── <input>_cycle_1_best.fa
+│   └── ...
+├── backbones/
+│   ├── <input>_cycle_1_seq_0.pdb
+│   ├── <input>_cycle_1_seq_1.pdb
+│   └── ...
+├── relaxed/
+│   ├── <input>_cycle_1_seq_0_relaxed.pdb
+│   ├── <input>_cycle_1_seq_1_relaxed.pdb
+│   ├── <input>_cycle_1_relaxed.pdb      # selected best structure
+│   └── ...
+└── stats/
+    ├── <input>_cycle_1.json
+    └── ...
 ```
-output_directory/
-├── seqs/                          # Generated sequences
-│   ├── input_cycle_1.fa          #   FASTA format with MPNN scores
-│   └── input_cycle_N.fa
-├── backbones/                     # Intermediate structures
-│   ├── input_cycle_1_threaded.pdb #   Post-threading structures
-│   └── input_cycle_N_threaded.pdb
-├── relaxed/                       # Optimized structures
-│   ├── input_cycle_1_relaxed.pdb #   Final relaxed structures
-│   └── input_cycle_N_relaxed.pdb
-└── stats/ (optional)             # Performance metrics
-    ├── input_cycle_1.json        #   Energy/score statistics
-    └── input_cycle_N.json
-```
 
-## Technical Details
+Each cycle stores all generated sequences, candidate structures, relaxed structures, and the selected best relaxed state. When `--save_stats` is enabled, JSON files include MPNN scores, selection metric values, Rosetta metrics, and cycle metadata.
 
-### Distance Constraints
+## Observed optimization trends
 
-Distance constraints between ligand atoms and nearby protein residues maintain binding geometry:
+In example runs, ddG-guided recycling showed two useful computational trends:
 
-```python
-def extract_dist_cst_from_pdb(pdb_in, lig_tr_atms, bsite_res=''):
-    parser = PDBParser(QUIET=True)
-    # Vectorized distance calculations with NumPy
-    # Generates: AtomPair O1 147 CA 45 HARMONIC 3.2 0.5
-```
+- the minimum Rosetta `ddg` within each sampled candidate pool decreased across cycles;
+- the MPNN score of the selected design improved across cycles.
 
-### Performance Features
+These observations support the interpretation that recycling the best post-relaxation state can shift the subsequent LigandMPNN sampling distribution toward more favorable and more designable candidates. These are computational trends and should be validated experimentally for any specific design campaign.
 
-- **Parallel Processing**: Multiple structures relaxed simultaneously using multiprocessing
-- **Multithreading**: Configurable thread allocation per PyRosetta process
-- **GPU Acceleration**: LigandMPNN inference on CUDA
-- **Vectorized Operations**: NumPy-based calculations
+## Notes and limitations
 
-## Results
+- FastRelax provides local structural refinement; it is not a global backbone search method.
+- Rosetta `ddg` is a steering metric, not experimental binding affinity.
+- Greedy best-one recycling can reduce diversity across cycles. A future extension could recycle top-K states or use beam search.
+- Regenerating constraints from the current candidate can enable adaptive local search, but it may also allow drift from an initial binding motif if constraints are not chosen carefully.
+- Final designs should be checked with additional filters, structural inspection, and experimental validation.
 
-**Optimization metrics** from runs with protein-ligand complexes:
+## Example data
 
-- **MPNN Score**: ~0.85 → ~0.55 (lower is better)
-- **DDG**: ~-25 → ~-35 REU (binding energy improvement)
-- **Residue Total Score**: Stabilized around -2.4 to -3.2 REU
-- **CMS**: Maintained ~240-270 (confidence levels)
-
-Most improvements occur within the first 10-15 cycles.
-
-## Troubleshooting
-
-**Common Issues:**
-1. **Memory errors**: Reduce `--num_processes` or `--pyrosetta_threads`
-2. **Slow performance**: Check GPU availability for LigandMPNN
-3. **Missing ligand**: Verify `.params` file path and format
-4. **Poor optimization**: Try different `--temperature` values (0.05-0.3)
-
-**Tips:**
-- Use `--pack_side_chains` for better optimization
-- Set `--target_atm_for_cst` for key ligand interactions
-- Monitor with `--save_stats`
+See the [`example/`](example/) directory for sample inputs and analysis scripts.
 
 ## Citation
 
 ```bibtex
-@software{jang2025_ligandmpnn_fastrelax,
+@software{jang2025_metric_guided_ligandmpnn_recycling,
   author = {Jang, David Hyunyoo},
-  title = {Iterative LigandMPNN-FastRelax for Backbone Optimization},
+  title = {Metric-Guided LigandMPNN Recycling for Backbone-Conditioned Sequence Space Optimization},
   year = {2025},
-  url = {https://github.com/daylight/ligandMPNN_FR}
+  url = {https://github.com/daylight-00/ligandMPNN_FR}
 }
 ```
 
 ## References
 
-This implementation is based on the LigandMPNN-FR concept by Gyu Rie Lee (2022). The original script is available in the `original_script/` directory for reference. For detailed comparison with the original implementation, see [`original_script/README.md`](original_script/README.md).
-
-**Related Work:**
-- **LigandMPNN**: Dauparas et al. (2022)
-- **PyRosetta**: Chaudhury et al. (2010)
+- Original LigandMPNN-FR concept and implementation: Gyu Rie Lee, 2022.
+- LigandMPNN: Dauparas et al.
+- PyRosetta: Chaudhury et al.
