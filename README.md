@@ -1,4 +1,7 @@
-# Metric-Guided LigandMPNN Recycling for Backbone-Conditioned Sequence Space Optimization
+# Metric-Guided LigandMPNN Recycling for Backbone-Conditioned Sequence Sampling Space Optimization
+
+![Optimization Results](example/fastrelax_scores.svg)
+*Figure: Optimization results across 32 cycles for protein-ligand complexes, showing improvements in MPNN scores and binding energies (DDG).*
 
 This repository implements a **directional LigandMPNN–FastRelax recycling pipeline** for protein–ligand design. Instead of only drawing more LigandMPNN samples from a fixed input backbone, the pipeline uses post-relaxation metrics to select the best relaxed protein–ligand state and recycles that state into the next LigandMPNN sampling round.
 
@@ -11,10 +14,6 @@ sample sequence candidates
 → recycle the best relaxed state
 → sample again from the updated backbone-ligand state
 ```
-
-## Project Context
-
-This project was developed during a research internship in the Artificial Intelligence Protein Design Lab under the supervision of Prof. Gyu Rie Lee. It builds on Prof. Lee’s earlier LigandMPNN–Rosetta recycling workflow and reframes the loop as a metric-guided search over backbone-conditioned sequence sampling spaces.
 
 ## Key idea
 
@@ -44,12 +43,12 @@ LigandMPNN samples N sequences from P(seq | B_t)
         ▼
 Generate candidate structures
         │
-        ├─ optional LigandMPNN side-chain packing
+        ├─ LigandMPNN side-chain packing (optional)
         │
         ▼
 PyRosetta FastRelax for each candidate
         │
-        ├─ optional ligand-distance constraints
+        ├─ ligand-distance constraints (optional)
         ├─ Rosetta metrics: ddg, totalscore, res_totalscore, cms
         │
         ▼
@@ -81,24 +80,6 @@ Update rule:
 ```
 
 This is a greedy, metric-guided directional search over local backbone-ligand states. It should not be interpreted as global backbone optimization.
-
-## Relationship to the original GRL LigandMPNN-FR script
-
-This project builds on the 2022 LigandMPNN-FR concept by Gyu Rie Lee. The original script already contained an important recycling idea: LigandMPNN-designed sequences were threaded and refined with Rosetta, and the resulting PDBs were reused as inputs for later LigandMPNN cycles.
-
-The current implementation changes the role of recycling:
-
-```text
-Original GRL view:
-  LigandMPNN output → Rosetta cleanup/refinement → recycle structures
-
-Current view:
-  candidate pool → FastRelax every candidate → metric-guided best-state selection → recycle selected state
-```
-
-The central methodological change is that Rosetta metrics are no longer only recorded after refinement. They become the steering signal that determines which backbone-ligand state defines the next LigandMPNN sampling space.
-
-See [`original_script/`](original_script/) for the preserved baseline script and a more detailed comparison.
 
 ## Features
 
@@ -283,9 +264,39 @@ These observations support the interpretation that recycling the best post-relax
 - Regenerating constraints from the current candidate can enable adaptive local search, but it may also allow drift from an initial binding motif if constraints are not chosen carefully.
 - Final designs should be checked with additional filters, structural inspection, and experimental validation.
 
-## Example data
+## Relationship to the original LigandMPNN-FR script
 
-See the [`example/`](example/) directory for sample inputs and analysis scripts.
+This project builds on the 2022 LigandMPNN-FR concept by Gyu Rie Lee. The original script already contained an important recycling idea: LigandMPNN-designed sequences were threaded and refined with Rosetta, and the resulting PDBs were reused as inputs for later LigandMPNN cycles.
+
+The current implementation changes the role of recycling:
+
+```text
+Original view:
+  LigandMPNN output → Rosetta cleanup/refinement → recycle structures
+
+Current view:
+  candidate pool → FastRelax every candidate → metric-guided best-state selection → recycle selected state
+```
+
+The central methodological change is that Rosetta metrics are no longer only recorded after refinement. They become the steering signal that determines which backbone-ligand state defines the next LigandMPNN sampling space.
+
+See [`original_script/`](original_script/) for the preserved baseline script and a more detailed comparison.
+
+## Relationship to Other Projects
+
+This repository is complementary to the [*ligand_binder_design*](https://github.com/daylight-00/ligand_binder_design) project.
+
+```text
+ligand_binder_design:
+    end-to-end target-design workflow
+    generation → filtering → sequence design → refolding → metric lineage
+
+ligandMPNN_FR:
+    metric-guided LigandMPNN–FastRelax recycling
+    optimization of backbone-conditioned sequence sampling spaces
+```
+
+Together, the two projects represent different layers of the small-molecule binder design process: a practical binder-design campaign pipeline and a more focused optimization strategy for improving candidate pools.
 
 ## Citation
 
@@ -298,8 +309,11 @@ See the [`example/`](example/) directory for sample inputs and analysis scripts.
 }
 ```
 
+## Acknowledgements
+
+This project was developed during a research internship in the [*Artificial Intelligence Protein Design Lab*](https://sites.google.com/view/aipdlab) under the supervision of Prof. Gyu Rie Lee. It builds on Prof. Lee’s earlier LigandMPNN–Rosetta recycling workflow and reframes the loop as a metric-guided search over backbone-conditioned sequence sampling spaces.
+
 ## References
 
-- Original LigandMPNN-FR concept and implementation: Gyu Rie Lee, 2022.
 - LigandMPNN: Dauparas et al.
 - PyRosetta: Chaudhury et al.
